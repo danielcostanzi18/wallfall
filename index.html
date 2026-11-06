@@ -72,7 +72,7 @@
     <div class="card howto" id="howto"></div>
     <div class="card best"><span class="label">Best</span><span class="value small" id="best">0</span></div>
     <div class="keys">Keys: P1 A/D move · W/Q rotate · S drop — P2 ←→ move · ↑ rotate · ↓ drop<br>
-      Enter start · P pause · 0/1/2 players · C step/carry controls · F fullscreen · M swap sides · B gesture debug</div>
+      Enter start · P pause · 0/1/2 players · F fullscreen · M swap sides · B gesture debug</div>
   </div>
 </div>
 <video id="video" playsinline muted></video>
@@ -85,19 +85,19 @@ import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@m
 // from the camera. Raise the *On values to demand wider/bigger gestures.
 // ---------------------------------------------------------------------------
 const C = {
-  scheme: 'step',   // 'step' (each gesture = one move or one rotation) or 'carry' (block follows your hands); C key toggles
   // Every gesture does ONE thing (one column or one 90° turn), then you must return to HOME:
   // both hands up in front of you, level, centred on your body. All in shoulder widths.
+  // Area hysteresis: HOME (re-arm) is smaller than the action thresholds; the band between does nothing.
   homeShift: 0.3,   // home: hands' midpoint within this of your body centre
   homeLevel: 0.3,   // home: hands level within this
-  stepOn: 0.7,      // both hands this far sideways -> move one column
-  liftOn: 0.7,      // one hand this much higher than the other -> rotate 90° (left hand up = clockwise)
-  // carry mode: the slice of the camera width (0 = players' left edge, 1 = right edge) that maps onto the 10 columns
-  carryZones: { solo: [0.2, 0.8], p1: [0.08, 0.46], p2: [0.54, 0.92] },
-  carryDeadband: 0.6,  // columns of hysteresis so the piece doesn't flicker between two columns
-  carrySmoothing: 0.5, // 0..1: higher follows the hands faster but jitters more
-  carryStepMs: 35,     // ms per column while the piece slides to your hands
-  carryMaxDrop: 1.3,   // (both modes) hands count as "holding" only when higher than this many shoulder widths below the shoulders (≈ waist)
+  stepOn: 0.55,     // both hands this far sideways -> move one column
+  liftOn: 0.7,      // one hand this much higher than the other (lift one, or drop the other) -> rotate 90°
+                    // (left hand higher = clockwise)
+  // Movement hysteresis: right after an action, the OPPOSITE action needs this much extra travel,
+  // until your hands come to rest at home. Stops the swing back (and its overshoot) from undoing it.
+  reverseMargin: 0.25,
+  restSpeed: 1.5,   // "at rest" = hands moving slower than this (shoulder widths per second)
+  holdMaxDrop: 1.3, // a hand counts as "up in front" when above this many shoulder widths below the shoulders (≈ waist)
   handUpOn: 0.25,   // both wrists this far above the nose -> "hands up" (start / resume)
   handUpOff: -0.05,
   squatOn: 0.55,    // shoulders this far below standing height -> squat
@@ -383,7 +383,7 @@ function makePlayer(i) {
     ov: q('.overlay'), ovTitle: q('.ovTitle'), ovSub: q('.ovSub'), holdFill: q('.holdFill'), dbgEl: q('.dbgtxt'),
     hud: { score: q('[data-k=score]'), level: q('[data-k=level]'), lines: q('[data-k=lines]') },
     chips: Object.fromEntries([...el.querySelectorAll('[data-c]')].map(c => [c.dataset.c, c])),
-    S: { up: mkSw(), squat: mkSw() }, armed: false, homeN: 0, gestN: 0, flash: null,
+    S: { up: mkSw(), squat: mkSw() }, gs: 'NO_HANDS', gsT: 0, gestN: 0, flash: null, lastAct: null, speed: null, prevShift: null, prevLift: 0, prevT: 0,
     ref: null, calib: [], tallN: 0, moveDir: 0, moveNext: 0, softNext: 0, holdStart: null, needLower: false,
     lastSeen: 0, lastX: null, seen: false, lm: null, dbg: null,
   };
@@ -536,7 +536,7 @@ function drawBoard(p) {
   }
   // Step mode: a little "held block" at the top that moves and tilts with your hands.
   // Dashed box = HOME, ticks = how far to swing sideways.
-  if (C.scheme === 'step' && g.state === 'playing') {
+  if (g.state === 'playing') {
     const d = p.dbg, mid = W / 2, range = C.stepOn * 1.5, unit = W * 0.32 / range, y = cell * 0.6;
     ctx.fillStyle = p.color; ctx.globalAlpha = 0.25; ctx.fillRect(mid - range * unit, y - 2, 2 * range * unit, 4); ctx.globalAlpha = 1;
     ctx.fillStyle = 'rgba(255,255,255,.6)';
@@ -550,22 +550,12 @@ function drawBoard(p) {
       ctx.fillStyle = handColor(p); ctx.beginPath(); ctx.roundRect(-cell * 0.6, -cell * 0.16, cell * 1.2, cell * 0.32, cell * 0.08); ctx.fill();
       ctx.restore();
     }
-    const msg = !poseReady ? '' : d && p.ref == null ? 'measuring your height…' : !d || !p.holding ? 'raise your hands to grab' : p.S.squat.on ? 'squatting' : !p.armed ? 'back to home' : '';
+    const msg = !poseReady ? '' : d && p.ref == null ? 'measuring your height…'
+      : { NO_HANDS: 'raise your hands', SQUAT: 'squatting', RETURN: 'back to home', READY: '' }[p.gs] ?? '';
     if (msg) {
       ctx.font = `700 ${cell * 0.42}px system-ui, sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
       ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(7,7,13,.85)'; ctx.strokeText(msg, W / 2, cell * 1.1);
       ctx.fillStyle = 'rgba(255,255,255,.75)'; ctx.fillText(msg, W / 2, cell * 1.1);
-    }
-  }
-  // Carry mode: show where your hands are, right where you're looking.
-  if (C.scheme === 'carry' && g.state === 'playing') {
-    ctx.fillStyle = p.color; ctx.globalAlpha = 0.18; ctx.fillRect(0, 0, W, cell * 0.16); ctx.globalAlpha = 1;
-    if (p.carryT != null && pc) {
-      const x = p.carryCenter * cell;
-      ctx.beginPath(); ctx.moveTo(x - cell * 0.45, 0); ctx.lineTo(x + cell * 0.45, 0); ctx.lineTo(x, cell * 0.55); ctx.closePath(); ctx.fill();
-    } else if (poseReady) {
-      ctx.font = `700 ${cell * 0.42}px system-ui, sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
-      ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.fillText('raise your hands to grab', W / 2, cell * 0.3);
     }
   }
   if (g.popup) {
@@ -597,6 +587,11 @@ let detectErrors = 0, firstDetect = true;
 // With the camera facing the players this is the mirrored image; M flips it.
 const vx = x => swapLR ? x : 1 - x;
 
+function setGs(p, st, now, why) {
+  if (p.gs === st) return;
+  if (verbose) log(`${p.name}: ${p.gs} -> ${st}${why ? ' (' + why + ')' : ''}`);
+  p.gs = st; p.gsT = now; p.gestN = 0;
+}
 function updSw(s, onCond, offCond) {
   if (!s.on) {
     if (onCond) { if (++s.n >= C.confirmFrames) { s.on = true; s.n = 0; return 'rise'; } } else s.n = 0;
@@ -612,33 +607,17 @@ function resetRef(p, why) {
 }
 function resetGestures(p) {
   for (const k in p.S) { p.S[k].on = false; p.S[k].n = 0; }
-  p.dbg = null; p.handX = null; p.holding = false;
-  p.armed = false; p.homeN = 0; p.gestN = 0;
+  p.dbg = null; p.holding = false;
+  p.gs = 'NO_HANDS'; p.gestN = 0; p.speed = null; p.prevShift = null;
 }
 // Colour of the "held block" feedback: green = action just fired, yellow = squatting,
-// player colour = at home and ready, grey = go back home first.
+// player colour = READY, grey = not ready (go back home).
 function handColor(p) {
   if (p.flash && performance.now() - p.flash.t < 300) return '#3cff9e';
   if (p.S.squat.on) return '#ffd84d';
-  return p.armed ? p.color : '#6b6f8f';
+  return p.gs === 'READY' ? p.color : '#6b6f8f';
 }
-const zoneFor = p => solo ? C.carryZones.solo : p.i ? C.carryZones.p2 : C.carryZones.p1;
-// Carry mode: which column the piece should be in, from the hands' position.
-function carryTarget(p) {
-  const pc = p.game.piece;
-  if (!pc || p.handX == null) { p.carryT = null; return null; }
-  const [z0, z1] = zoneFor(p);
-  const t = Math.max(0, Math.min(1, (p.handX - z0) / (z1 - z0)));
-  p.carryT = t;
-  let minC = 9, maxC = -1;
-  eachCell(pc.m, c => { minC = Math.min(minC, c); maxC = Math.max(maxC, c); });
-  const span = COLS - (maxC - minC + 1), u = t * span;   // continuous left-edge column
-  p.carryCenter = u + (maxC - minC + 1) / 2;            // where the hands "are", in columns (for the marker)
-  if (p.carryPiece !== pc || p.carryCol == null) { p.carryPiece = pc; p.carryCol = Math.round(u); }
-  else if (Math.abs(u - p.carryCol) > C.carryDeadband) p.carryCol = Math.round(u);
-  p.carryCol = Math.max(0, Math.min(span, p.carryCol));
-  return p.carryCol - minC;
-}
+
 
 async function initCamera() {
   const status = $('#camStatus');
@@ -772,7 +751,8 @@ function processPlayer(p, lm, now) {
   const S = p.S;
 
   // "Holding" the block: both hands up in front, above about waist height.
-  p.holding = hands && (hL.y - shY) / sw < C.carryMaxDrop && (hR.y - shY) / sw < C.carryMaxDrop;
+  // At least one hand up in front (above about the waist): dropping one hand is a rotation, not "hands down".
+  p.holding = hands && (Math.min(hL.y, hR.y) - shY) / sw < C.holdMaxDrop;
   const shift = hands ? ((hL.x + hR.x) / 2 - cx) / sw : 0;   // + = both hands moved to the players' right
   const lift = hands ? (hR.y - hL.y) / sw : 0;                // + = left hand higher than the right
 
@@ -799,55 +779,57 @@ function processPlayer(p, lm, now) {
     if (++p.tallN > C.calibFrames * 3) resetRef(p, 'standing taller than measured');
   } else p.tallN = 0;
 
-  // Carry mode: the block follows the hands' position (never while squatting).
-  if (p.holding && !S.squat.on) {
-    const mx = (hL.x + hR.x) / 2 / W;
-    p.handX = p.handX == null ? mx : p.handX + (mx - p.handX) * C.carrySmoothing;
-  } else p.handX = null;
+  // How fast the hands are moving (shoulder widths per second, smoothed): used for "hold still".
+  if (p.prevShift != null && now > p.prevT) {
+    const v = Math.hypot(shift - p.prevShift, lift - p.prevLift) / ((now - p.prevT) / 1000);
+    p.speed = p.speed == null ? v : p.speed + (v - p.speed) * 0.5;
+  }
+  p.prevShift = shift; p.prevLift = lift; p.prevT = now;
 
-  // One gesture = one action, then back to HOME before anything else counts.
-  // HOME = hands up in front, level, centred (carry mode: just level, since moving is continuous).
-  // From home, whichever gesture crosses its threshold first wins: sideways = move, lift = rotate.
-  // Squatting (or dropping your arms) cancels everything until you're back home.
-  const carry = C.scheme === 'carry';
-  const atHome = p.holding && Math.abs(lift) < C.homeLevel && (carry || Math.abs(shift) < C.homeShift);
+  // ---- Gesture state machine: ONE gesture = ONE action, always back home in between ----
+  //   NO_HANDS --a hand up in front--> RETURN --enter HOME--> READY (immediately, no timer)
+  //   READY    --both hands sideways past stepOn--> MOVE one column        --> RETURN
+  //            --hands' height difference past liftOn (lift one or drop the other)
+  //                                              --> ROTATE 90° (left higher = CW) --> RETURN
+  //   any      --squat--> SQUAT (soft drop only, nothing else) --stand up--> RETURN
+  //   any      --both hands down / not visible--> NO_HANDS
+  // Hysteresis: HOME is smaller than the action thresholds (area), and right after an action the
+  // opposite action needs reverseMargin extra until the hands are at rest at home (movement).
+  const atHome = Math.abs(shift) < C.homeShift && Math.abs(lift) < C.homeLevel;
+  if (atHome && (p.speed ?? 0) < C.restSpeed) p.lastAct = null;      // at rest at home: no more reverse margin
+  const OPP = { left: 'right', right: 'left', cw: 'ccw', ccw: 'cw' };
+  const need = (act, base) => base + (p.lastAct && OPP[p.lastAct] === act ? C.reverseMargin : 0);
   let action = null;
-  if (S.squat.on || !p.holding) { p.armed = false; p.homeN = 0; p.gestN = 0; }
-  else if (!p.armed) {
-    p.homeN = atHome ? p.homeN + 1 : 0;
-    if (p.homeN >= C.confirmFrames) { p.armed = true; p.gestN = 0; }
-  } else {
-    const sScore = carry ? 0 : Math.abs(shift) / C.stepOn, rScore = Math.abs(lift) / C.liftOn;
-    p.gestN = sScore >= 1 || rScore >= 1 ? p.gestN + 1 : 0;
-    if (p.gestN >= C.confirmFrames) {
-      action = sScore >= rScore ? (shift > 0 ? 'right' : 'left') : (lift > 0 ? 'cw' : 'ccw');
-      p.armed = false; p.homeN = 0; p.gestN = 0; p.flash = { action, t: now };
-      if (action === 'left') p.game.move(-1);
-      else if (action === 'right') p.game.move(1);
-      else p.game.rotate(action === 'cw' ? 1 : -1);
+  if (S.squat.on) setGs(p, 'SQUAT', now);
+  else if (!p.holding) setGs(p, 'NO_HANDS', now);
+  else switch (p.gs) {
+    case 'RETURN':
+      if (atHome) setGs(p, 'READY', now);
+      break;
+    case 'READY': {
+      const sAct = shift > 0 ? 'right' : 'left', rAct = lift > 0 ? 'cw' : 'ccw';
+      const sScore = Math.abs(shift) / need(sAct, C.stepOn), rScore = Math.abs(lift) / need(rAct, C.liftOn);
+      p.gestN = sScore >= 1 || rScore >= 1 ? p.gestN + 1 : 0;
+      if (p.gestN >= C.confirmFrames) {
+        action = sScore >= rScore ? sAct : rAct;
+        p.gestN = 0; p.flash = { action, t: now }; p.lastAct = action;
+        if (action === 'left') p.game.move(-1);
+        else if (action === 'right') p.game.move(1);
+        else p.game.rotate(action === 'cw' ? 1 : -1);
+        log(`${p.name}: ${{ left: 'MOVE ◀', right: 'MOVE ▶', cw: 'ROTATE ↻', ccw: 'ROTATE ↺' }[action]}  (shift ${shift.toFixed(2)}, lift ${lift.toFixed(2)})`);
+        setGs(p, 'RETURN', now);
+      }
+      break;
     }
+    default:   // NO_HANDS / SQUAT -> must come back home first
+      setGs(p, 'RETURN', now);
   }
-
-  if (verbose) {
-    if (action) log(`${p.name}: ${action}  (shift ${shift.toFixed(2)}/${C.stepOn}, lift ${lift.toFixed(2)}/${C.liftOn})`);
-    if (eSq === 'rise') log(`${p.name}: squat (${drop.toFixed(2)})`);
-    if (!!p.armed !== !!p.wasArmed) log(`${p.name}: ${p.armed ? 'home, ready' : 'waiting for home'}`);
-  }
-  p.wasArmed = p.armed;
+  if (verbose && eSq === 'rise') log(`${p.name}: squat (${drop.toFixed(2)})`);
   p.dbg = { hands, hLi: hL.i, hRi: hR.i, shift, lift, drop };
 }
 
 function applyPlayer(p, now) {
   const g = p.game, S = p.S;
-  let want = 0;
-  if (C.scheme === 'carry') {
-    // Slide the piece toward the column under the hands, one step at a time (respects walls/blocks).
-    const tx = carryTarget(p);
-    if (g.playing && tx != null && !S.squat.on) want = Math.sign(tx - g.piece.x);
-    if (want && now >= p.moveNext) { g.move(want); p.moveNext = now + C.carryStepMs; }
-  } else {
-  }
-
   if (S.squat.on && g.playing && now >= p.softNext) { g.softDrop(); p.softNext = now + C.softDropMs; }
 
   // Start / resume: hold both hands up
@@ -862,18 +844,15 @@ function applyPlayer(p, now) {
   if (g.state === 'playing' && poseReady && now - p.lastSeen > C.lostPauseMs) g.pause('Lost sight of you.');
 
   const c = p.chips, fl = p.flash && now - p.flash.t < 300 ? p.flash.action : null;
-  c.left.classList.toggle('on', fl === 'left' || want === -1);
-  c.right.classList.toggle('on', fl === 'right' || want === 1);
+  c.left.classList.toggle('on', fl === 'left');
+  c.right.classList.toggle('on', fl === 'right');
   c.ccw.classList.toggle('on', fl === 'ccw');
   c.cw.classList.toggle('on', fl === 'cw');
   c.squat.classList.toggle('on', S.squat.on);
   const d = p.dbg;
   p.dbgEl.textContent = showDbg && d
-    ? `${p.armed ? 'HOME ✓ ready' : 'back to home'}\n` +
-      (C.scheme === 'carry'
-        ? `hands ${p.carryT == null ? '-' : (p.carryT * 100).toFixed(0) + '%'}\n`
-        : `shift ${d.shift.toFixed(2)} (>${C.stepOn})\n`) +
-      `lift  ${d.lift.toFixed(2)} (>${C.liftOn})\nsquat ${d.drop.toFixed(2)} (>${C.squatOn})`
+    ? `state ${p.gs}${p.lastAct ? ' (just did ' + p.lastAct + ')' : ''}\nshift ${d.shift.toFixed(2)} (>${C.stepOn})\n` +
+      `lift  ${d.lift.toFixed(2)} (>${C.liftOn})\nspeed ${(p.speed ?? 0).toFixed(1)}\nsquat ${d.drop.toFixed(2)} (>${C.squatOn})`
     : '';
 }
 
@@ -893,19 +872,6 @@ function drawCam() {
     ctx.beginPath(); ctx.moveTo(w / 2, 0); ctx.lineTo(w / 2, h); ctx.stroke(); ctx.setLineDash([]);
     ctx.fillStyle = PCOLORS[0]; ctx.textAlign = 'left'; ctx.fillText('P1', 8, 6);
     ctx.fillStyle = PCOLORS[1]; ctx.textAlign = 'right'; ctx.fillText('P2', w - 8, 6);
-  }
-  if (C.scheme === 'carry') {
-    // Each player's carry zone: the strip of floor/air that maps onto their 10 columns.
-    for (const p of players) {
-      if (solo && p.i) continue;
-      const [z0, z1] = zoneFor(p), y = h - 14;
-      ctx.strokeStyle = p.color; ctx.fillStyle = p.color; ctx.lineWidth = 3; ctx.globalAlpha = 0.7;
-      ctx.beginPath(); ctx.moveTo(z0 * w, y - 8); ctx.lineTo(z0 * w, y); ctx.lineTo(z1 * w, y); ctx.lineTo(z1 * w, y - 8); ctx.stroke();
-      ctx.lineWidth = 1;
-      for (let c = 1; c < COLS; c++) { const x = (z0 + (z1 - z0) * c / COLS) * w; ctx.beginPath(); ctx.moveTo(x, y - 4); ctx.lineTo(x, y); ctx.stroke(); }
-      ctx.globalAlpha = 1;
-      if (p.handX != null) { ctx.beginPath(); ctx.arc(Math.max(z0, Math.min(z1, p.handX)) * w, y, 7, 0, 7); ctx.fill(); }
-    }
   }
   for (const p of players) if (p.lm) drawSkeleton(p, w, h);
 }
@@ -954,7 +920,6 @@ addEventListener('keydown', e => {
   const active = solo ? [players[0]] : players;
   if (k === 'f') { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {}); return; }
   if (k === 'm') { swapLR = !swapLR; log('Sides ' + (swapLR ? 'swapped' : 'normal')); return; }
-  if (k === 'c') { setScheme(C.scheme === 'carry' ? 'step' : 'carry'); return; }
   if (k === 'b') { showDbg = verbose = !showDbg; log('Gesture debug ' + (verbose ? 'on' : 'off')); return; }
   if (k === '0' || k === '1' || k === '2') { setModeSetting(k === '0' ? 'auto' : k === '1' ? 'solo' : 'duo'); return; }
   if (k === 'p') {
@@ -984,24 +949,18 @@ function frame(now) {
   drawCam();
   requestAnimationFrame(frame);
 }
-function setScheme(s) {
-  C.scheme = s;
-  try { localStorage.setItem('wallfall-scheme', s); } catch (e) {}
+function setHelp() {
   $('#howto').innerHTML =
     `<b>HOME</b>: both hands up in front of you, level.<br>
-     From home, do <b>one</b> gesture, then go back home:<br>` +
-    (s === 'carry'
-      ? `<b>Carry</b>: the block follows your hands left / right<br>`
-      : `<b>Both hands sideways</b>: move one column<br>`) +
-    `<b>Lift left hand</b>: rotate ↻ · <b>lift right hand</b>: rotate ↺<br>
+     From home do <b>one</b> gesture, then go back home:<br>
+     <b>Both hands sideways</b>: move one column<br>
+     <b>Left hand higher</b> (lift it, or drop the right): rotate ↻ · <b>right hand higher</b>: rotate ↺<br>
      <b>Squat</b>: drop faster (nothing else counts while squatting)<br>
-     <b>Both hands above your head</b>: start / resume
-     <div class="label" style="margin-top:.8vh">Controls: ${s} · C to switch</div>`;
-  log(`Controls: ${s}`);
+     <b>Both hands above your head</b>: start / resume`;
 }
 addEventListener('resize', resize);
-try { const s = localStorage.getItem('wallfall-scheme'); if (s === 'carry' || s === 'step') C.scheme = s; } catch (e) {}
-setScheme(C.scheme);
+try { localStorage.removeItem('wallfall-scheme'); } catch (e) {}   // old carry/step setting: no longer used
+setHelp();
 setMode(solo);
 requestAnimationFrame(frame);
 initCamera();

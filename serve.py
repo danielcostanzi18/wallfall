@@ -22,6 +22,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_response(204)
         self.end_headers()
 
+    def end_headers(self):
+        # Never cache the game files: a normal reload always picks up the latest version.
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
     def log_message(self, fmt, *args):
         # Keep the terminal for game logs: only show failed requests.
         if len(args) > 1 and str(args[1]).startswith(("4", "5")):
