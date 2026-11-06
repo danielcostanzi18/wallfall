@@ -47,7 +47,7 @@
   .hold { width: 70%; height: 1.2vh; background: var(--line); border-radius: 99px; overflow: hidden; }
   .holdFill { height: 100%; width: 0; background: var(--on); }
 
-  .center { width: 20vw; display: flex; flex-direction: column; gap: 1.6vh; }
+  .center { width: 20vw; display: flex; flex-direction: column; gap: 1.1vh; }
   body.solo .center { width: 24vw; }
   h1 { margin: 0; font-size: 5.5vh; letter-spacing: .12em; font-weight: 900; text-align: center;
     background: linear-gradient(90deg, #ff5fa2, #ffd84d, #5ce1e6); -webkit-background-clip: text;
@@ -55,7 +55,7 @@
   #cam { display: block; width: 100%; border-radius: 12px; background: #000; border: 2px solid var(--line); }
   #camStatus { font-size: 1.8vh; color: var(--muted); min-height: 2.2vh; text-align: center; }
   #camStatus.err { color: var(--warn); }
-  .howto { font-size: 1.9vh; line-height: 1.55; }
+  .howto { font-size: 1.75vh; line-height: 1.5; }
   .howto b { color: var(--accent); }
   .best { display: flex; justify-content: space-between; align-items: baseline; }
   .keys { font-size: 1.4vh; color: var(--muted); line-height: 1.5; }
@@ -68,16 +68,11 @@
     <h1>WALLFALL</h1>
     <canvas id="cam" width="480" height="270"></canvas>
     <div id="camStatus">Starting camera…</div>
-    <div class="card howto">
-      Hold your hands out in front, <b>as if holding the block</b>.<br>
-      <b>Shift both hands</b> left / right: move<br>
-      <b>Tilt it</b> (one hand up, one down): rotate<br>
-      <b>Squat</b>: drop faster<br>
-      <b>Both hands above your head</b>: start / resume
-    </div>
+    <div class="label" id="modeLabel" style="text-align:center"></div>
+    <div class="card howto" id="howto"></div>
     <div class="card best"><span class="label">Best</span><span class="value small" id="best">0</span></div>
     <div class="keys">Keys: P1 A/D move · W/Q rotate · S drop — P2 ←→ move · ↑ rotate · ↓ drop<br>
-      Enter start · P pause · 1/2 players · F fullscreen · M swap sides · B gesture debug</div>
+      Enter start · P pause · 0/1/2 players · C step/carry controls · F fullscreen · M swap sides · B gesture debug</div>
   </div>
 </div>
 <video id="video" playsinline muted></video>
@@ -90,21 +85,33 @@ import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@m
 // from the camera. Raise the *On values to demand wider/bigger gestures.
 // ---------------------------------------------------------------------------
 const C = {
-  moveOn: 1.0,      // midpoint of both hands this far left/right of the body -> move
-  moveOff: 0.6,     // ...and must come back inside this to stop
-  moveCross: 0.1,   // the trailing hand must also be past the body centre (so one arm alone doesn't count)
-  tiltOn: 1.0,      // height difference between the hands -> rotate (once per tilt)
-  tiltOff: 0.35,    // hands must level out below this before the next rotation
+  scheme: 'step',   // 'step' (each gesture = one move or one rotation) or 'carry' (block follows your hands); C key toggles
+  // Every gesture does ONE thing (one column or one 90° turn), then you must return to HOME:
+  // both hands up in front of you, level, centred on your body. All in shoulder widths.
+  homeShift: 0.3,   // home: hands' midpoint within this of your body centre
+  homeLevel: 0.3,   // home: hands level within this
+  stepOn: 0.7,      // both hands this far sideways -> move one column
+  liftOn: 0.7,      // one hand this much higher than the other -> rotate 90° (left hand up = clockwise)
+  // carry mode: the slice of the camera width (0 = players' left edge, 1 = right edge) that maps onto the 10 columns
+  carryZones: { solo: [0.2, 0.8], p1: [0.08, 0.46], p2: [0.54, 0.92] },
+  carryDeadband: 0.6,  // columns of hysteresis so the piece doesn't flicker between two columns
+  carrySmoothing: 0.5, // 0..1: higher follows the hands faster but jitters more
+  carryStepMs: 35,     // ms per column while the piece slides to your hands
+  carryMaxDrop: 1.3,   // (both modes) hands count as "holding" only when higher than this many shoulder widths below the shoulders (≈ waist)
   handUpOn: 0.25,   // both wrists this far above the nose -> "hands up" (start / resume)
   handUpOff: -0.05,
   squatOn: 0.55,    // shoulders this far below standing height -> squat
   squatOff: 0.30,
+  calibFrames: 15,  // standing height = median of this many camera frames (~0.5 s) at the start of each game,
+                    // taken only while your hands are below your shoulders (raised arms lift the shoulder points)
+  refForgetMs: 1500,// forget a player's standing height after they've been out of view this long
   confirmFrames: 2, // a pose must hold this many camera frames to count (kills jitter)
-  das: 320,         // ms before a held shift starts auto-repeating
-  arr: 130,         // ms between repeated moves while the hands stay shifted
   softDropMs: 55,   // ms per row while squatting
   startHoldMs: 700, // hold both hands up this long to start / resume
   lostPauseMs: 2000,// auto-pause a player's game after they've been out of view this long
+  autoDuoMs: 2000,      // auto players: two people in view this long -> 2-player mode
+  autoSoloMs: 3000,     // only one person in view this long -> 1-player mode...
+  autoSoloBusyMs: 12000,// ...but wait this long if the missing player was mid-game
   startGravity: 1000, minGravity: 90, gravityFactor: 0.85, // ms per row
   lockDelay: 500, maxLockResets: 15, clearMs: 260,
 };
@@ -190,21 +197,29 @@ function rotateM(m, dir) {
   return m.map((row, r) => row.map((_, c) => dir > 0 ? m[n - 1 - c][r] : m[c][n - 1 - r]));
 }
 
+// Shared piece order: every player draws from the same sequence, each at their own pace.
+// A fresh sequence starts when someone starts while nobody else is mid-game.
+let seq = [], seqBag = [];
+function seqAt(i) {
+  while (seq.length <= i) {
+    if (!seqBag.length) {
+      const b = Object.keys(SHAPES);
+      for (let k = b.length - 1; k > 0; k--) { const j = Math.random() * (k + 1) | 0; [b[k], b[j]] = [b[j], b[k]]; }
+      seqBag = b;
+    }
+    seq.push(seqBag.pop());
+  }
+  return seq[i];
+}
+
 class Game {
   constructor(p) { this.p = p; this.reset(); this.state = 'title'; }
   reset() {
-    this.board = newBoard(); this.bag = []; this.piece = null; this.next = null;
+    this.board = newBoard(); this.seqIdx = 0; this.piece = null; this.next = null;
     this.score = 0; this.lines = 0; this.level = 1; this.clearing = null; this.popup = null;
     this.dropAcc = 0; this.lockAcc = 0; this.lockResets = 0;
   }
-  nextType() {
-    if (!this.bag.length) {
-      const b = Object.keys(SHAPES);
-      for (let i = b.length - 1; i > 0; i--) { const j = Math.random() * (i + 1) | 0; [b[i], b[j]] = [b[j], b[i]]; }
-      this.bag = b;
-    }
-    return this.bag.pop();
-  }
+  nextType() { return seqAt(this.seqIdx++); }
   get playing() { return this.state === 'playing' && !!this.piece && !this.clearing; }
   collide(m, px, py) {
     for (let r = 0; r < m.length; r++) for (let c = 0; c < m.length; c++) {
@@ -217,9 +232,12 @@ class Game {
   }
   gravityMs() { return Math.max(C.minGravity, C.startGravity * Math.pow(C.gravityFactor, this.level - 1)); }
   start() {
-    this.reset(); this.next = this.nextType(); this.state = 'playing';
+    const others = players.filter(q => q.game !== this && ['playing', 'paused'].includes(q.game.state));
+    if (!others.length) { seq = []; seqBag = []; }
+    this.reset(); this.next = this.nextType(); this.state = 'playing'; resetRef(this.p, 'new game');
     hideOverlay(this.p); this.spawn(); updateHUD(this.p);
-    beep(660, .12, 'triangle', .06); log(`${this.p.name}: game started`);
+    beep(660, .12, 'triangle', .06);
+    log(`${this.p.name}: game started (${others.length ? 'same pieces as ' + others.map(q => q.name).join(', ') : 'new piece order'})`);
   }
   spawn() {
     const type = this.next; this.next = this.nextType();
@@ -306,7 +324,7 @@ class Game {
     this.state = 'over'; this.piece = null; this.p.needLower = true;
     if (this.score > best) { best = this.score; try { localStorage.setItem('wallfall-best', best); } catch (e) {} }
     updateHUD(this.p);
-    showOverlay(this.p, 'GAME OVER', `Score <b>${this.score}</b><br>Lower your arms, then<br><b>raise both hands &amp; hold</b><br>to play again.`);
+    showOverlay(this.p, 'GAME OVER', gameOverSub(this));
     beep(196, .4, 'sawtooth', .06);
     log(`${this.p.name}: game over (score ${this.score}, lines ${this.lines}, level ${this.level})`);
   }
@@ -318,7 +336,7 @@ class Game {
   }
   resume() {
     if (this.state !== 'paused') return;
-    this.state = 'playing'; hideOverlay(this.p); this.p.lastSeen = performance.now();
+    this.state = 'playing'; hideOverlay(this.p); this.p.lastSeen = performance.now(); resetRef(this.p, 'resumed');
     log(`${this.p.name}: resumed`);
   }
 }
@@ -326,8 +344,9 @@ class Game {
 // ---------------------------------------------------------------------------
 // Players: DOM + gesture state + game
 // ---------------------------------------------------------------------------
-let solo = false;
-try { solo = localStorage.getItem('wallfall-mode') === '1'; } catch (e) {}
+let solo = true, modeSetting = 'auto';   // modeSetting: 'auto' | 'solo' | 'duo'
+try { const m = localStorage.getItem('wallfall-mode'); if (['auto', 'solo', 'duo'].includes(m)) modeSetting = m; } catch (e) {}
+if (modeSetting === 'duo') solo = false;
 const mkSw = () => ({ on: false, n: 0 });
 
 function makePlayer(i) {
@@ -364,8 +383,8 @@ function makePlayer(i) {
     ov: q('.overlay'), ovTitle: q('.ovTitle'), ovSub: q('.ovSub'), holdFill: q('.holdFill'), dbgEl: q('.dbgtxt'),
     hud: { score: q('[data-k=score]'), level: q('[data-k=level]'), lines: q('[data-k=lines]') },
     chips: Object.fromEntries([...el.querySelectorAll('[data-c]')].map(c => [c.dataset.c, c])),
-    S: { moveL: mkSw(), moveR: mkSw(), tiltCcw: mkSw(), tiltCw: mkSw(), up: mkSw(), squat: mkSw() },
-    standY: null, moveDir: 0, moveNext: 0, softNext: 0, holdStart: null, needLower: false,
+    S: { up: mkSw(), squat: mkSw() }, armed: false, homeN: 0, gestN: 0, flash: null,
+    ref: null, calib: [], tallN: 0, moveDir: 0, moveNext: 0, softNext: 0, holdStart: null, needLower: false,
     lastSeen: 0, lastX: null, seen: false, lm: null, dbg: null,
   };
   p.bctx = p.boardCv.getContext('2d'); p.nctx = p.nextCv.getContext('2d');
@@ -391,14 +410,69 @@ function titleOverlay(p) {
   const where = solo ? 'Stand in front of the camera' : `Stand on the <b>${p.i ? 'right' : 'left'}</b> side`;
   showOverlay(p, solo ? 'WALLFALL' : p.name, `${where},<br>then <b>raise both hands &amp; hold</b><br>to start.`);
 }
-function setMode(isSolo) {
+const gameOverSub = g => `Score <b>${g.score}</b><br>Lower your arms, then<br><b>raise both hands &amp; hold</b><br>to play again.`;
+function refreshOverlay(p) {
+  const g = p.game;
+  if (g.state === 'playing') hideOverlay(p);
+  else if (g.state === 'title') titleOverlay(p);
+  else if (g.state === 'paused') showOverlay(p, 'PAUSED', '<b>Raise both hands &amp; hold</b> to resume.');
+  else showOverlay(p, 'GAME OVER', gameOverSub(g));
+}
+// Move the two games between the left and right boards (used when someone joins/leaves
+// so a running game follows its player to the side they're standing on).
+function swapGames() {
+  const [a, b] = players;
+  [a.game, b.game] = [b.game, a.game];
+  a.game.p = a; b.game.p = b;
+  players.forEach(p => { resetGestures(p); resetRef(p, 'players switched sides'); refreshOverlay(p); updateHUD(p); drawNext(p); });
+}
+function setMode(isSolo, why = '') {
+  const changed = solo !== isSolo;
   solo = isSolo;
   document.body.classList.toggle('solo', solo);
-  try { localStorage.setItem('wallfall-mode', solo ? '1' : '2'); } catch (e) {}
   if (solo) { players[1].game.reset(); players[1].game.state = 'title'; resetGestures(players[1]); players[1].lm = null; }
-  players.forEach(p => { if (p.game.state === 'title') titleOverlay(p); updateHUD(p); });
-  resize();
-  log(`Mode: ${solo ? '1 player' : '2 players'}`);
+  if (changed) players.forEach(p => resetRef(p, 'player count changed'));
+  players.forEach(p => { refreshOverlay(p); updateHUD(p); });
+  resize(); updateModeLabel();
+  if (changed || !why) log(`Mode: ${solo ? '1 player' : '2 players'}${why ? ' (' + why + ')' : ''}`);
+}
+function setModeSetting(s) {
+  modeSetting = s;
+  try { localStorage.setItem('wallfall-mode', s); } catch (e) {}
+  crowd.n = null;
+  if (s === 'solo') setMode(true, 'locked');
+  else if (s === 'duo') setMode(false, 'locked');
+  else { updateModeLabel(); log('Mode: auto (switches by how many people are in view)'); }
+}
+function updateModeLabel() {
+  $('#modeLabel').textContent = `Players: ${solo ? 1 : 2} (${modeSetting === 'auto' ? 'auto' : 'locked'}) · 0 auto · 1 / 2 lock`;
+}
+
+// Auto mode: pick 1 or 2 players from how many people the camera sees.
+const crowd = { n: null, since: 0 };
+function autoMode(list, now) {
+  if (modeSetting !== 'auto' || !poseReady || !list.length) { crowd.n = null; return; } // nobody in view: keep the current mode
+  const n = Math.min(list.length, 2);
+  if (crowd.n !== n) { crowd.n = n; crowd.since = now; }
+  const held = now - crowd.since;
+  const cx = lm => vx((lm[11].x + lm[12].x) / 2);
+  if (n === 2 && solo && held > C.autoDuoMs) {
+    // The solo game lives on the left board; if its player stands right of the newcomer, move it right.
+    const ref = players[0].lastX ?? 0.5;
+    const [d0, d1] = list.map(lm => Math.abs(cx(lm) - ref));
+    const me = d0 <= d1 ? list[0] : list[1], other = me === list[0] ? list[1] : list[0];
+    setMode(false, 'second player in view');
+    if (cx(me) > cx(other)) swapGames();
+    players[0].lastX = Math.min(cx(me), cx(other)); players[1].lastX = Math.max(cx(me), cx(other));
+  } else if (n === 1 && !solo) {
+    const stay = players.find(p => p.lm) || players[0], gone = stay === players[0] ? players[1] : players[0];
+    const busy = ['playing', 'paused'].includes(gone.game.state);
+    if (held > (busy ? C.autoSoloBusyMs : C.autoSoloMs)) {
+      if (busy) log(`${gone.name}: game ended (left the play area)`);
+      if (stay === players[1]) swapGames(); // solo plays on the left board
+      setMode(true, 'only one person in view');
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +534,40 @@ function drawBoard(p) {
     eachCell(pc.m, (c, r) => { if (gy + r >= 0) drawBlock(ctx, (pc.x + c) * cell, (gy + r) * cell, cell, COLORS[pc.type], true); });
     eachCell(pc.m, (c, r) => { if (pc.y + r >= 0) drawBlock(ctx, (pc.x + c) * cell, (pc.y + r) * cell, cell, COLORS[pc.type]); });
   }
+  // Step mode: a little "held block" at the top that moves and tilts with your hands.
+  // Dashed box = HOME, ticks = how far to swing sideways.
+  if (C.scheme === 'step' && g.state === 'playing') {
+    const d = p.dbg, mid = W / 2, range = C.stepOn * 1.5, unit = W * 0.32 / range, y = cell * 0.6;
+    ctx.fillStyle = p.color; ctx.globalAlpha = 0.25; ctx.fillRect(mid - range * unit, y - 2, 2 * range * unit, 4); ctx.globalAlpha = 1;
+    ctx.fillStyle = 'rgba(255,255,255,.6)';
+    for (const sgn of [-1, 1]) ctx.fillRect(mid + sgn * C.stepOn * unit - 1.5, y - cell * 0.3, 3, cell * 0.6);
+    ctx.strokeStyle = 'rgba(255,255,255,.45)'; ctx.lineWidth = 2; ctx.setLineDash([4, 3]);
+    ctx.strokeRect(mid - C.homeShift * unit - cell * 0.65, y - cell * 0.42, 2 * C.homeShift * unit + cell * 1.3, cell * 0.84);
+    ctx.setLineDash([]);
+    if (d && p.holding) {
+      const ang = Math.max(-40, Math.min(40, d.lift / C.liftOn * 30)) * Math.PI / 180; // left hand up = left end up
+      ctx.save(); ctx.translate(mid + Math.max(-range, Math.min(range, d.shift)) * unit, y); ctx.rotate(ang);
+      ctx.fillStyle = handColor(p); ctx.beginPath(); ctx.roundRect(-cell * 0.6, -cell * 0.16, cell * 1.2, cell * 0.32, cell * 0.08); ctx.fill();
+      ctx.restore();
+    }
+    const msg = !poseReady ? '' : d && p.ref == null ? 'measuring your height…' : !d || !p.holding ? 'raise your hands to grab' : p.S.squat.on ? 'squatting' : !p.armed ? 'back to home' : '';
+    if (msg) {
+      ctx.font = `700 ${cell * 0.42}px system-ui, sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+      ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(7,7,13,.85)'; ctx.strokeText(msg, W / 2, cell * 1.1);
+      ctx.fillStyle = 'rgba(255,255,255,.75)'; ctx.fillText(msg, W / 2, cell * 1.1);
+    }
+  }
+  // Carry mode: show where your hands are, right where you're looking.
+  if (C.scheme === 'carry' && g.state === 'playing') {
+    ctx.fillStyle = p.color; ctx.globalAlpha = 0.18; ctx.fillRect(0, 0, W, cell * 0.16); ctx.globalAlpha = 1;
+    if (p.carryT != null && pc) {
+      const x = p.carryCenter * cell;
+      ctx.beginPath(); ctx.moveTo(x - cell * 0.45, 0); ctx.lineTo(x + cell * 0.45, 0); ctx.lineTo(x, cell * 0.55); ctx.closePath(); ctx.fill();
+    } else if (poseReady) {
+      ctx.font = `700 ${cell * 0.42}px system-ui, sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+      ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.fillText('raise your hands to grab', W / 2, cell * 0.3);
+    }
+  }
   if (g.popup) {
     const k = g.popup.t / 900;
     ctx.save(); ctx.globalAlpha = 1 - k * k;
@@ -497,7 +605,40 @@ function updSw(s, onCond, offCond) {
   }
   return null;
 }
-function resetGestures(p) { for (const k in p.S) { p.S[k].on = false; p.S[k].n = 0; } p.standY = null; p.dbg = null; }
+// Standing height is measured fresh: at the start of each game, on resume, and when players change slots.
+function resetRef(p, why) {
+  p.ref = null; p.calib = []; p.tallN = 0; p.S.squat.on = false; p.S.squat.n = 0;
+  if (why && verbose) log(`${p.name}: measuring standing height (${why})`);
+}
+function resetGestures(p) {
+  for (const k in p.S) { p.S[k].on = false; p.S[k].n = 0; }
+  p.dbg = null; p.handX = null; p.holding = false;
+  p.armed = false; p.homeN = 0; p.gestN = 0;
+}
+// Colour of the "held block" feedback: green = action just fired, yellow = squatting,
+// player colour = at home and ready, grey = go back home first.
+function handColor(p) {
+  if (p.flash && performance.now() - p.flash.t < 300) return '#3cff9e';
+  if (p.S.squat.on) return '#ffd84d';
+  return p.armed ? p.color : '#6b6f8f';
+}
+const zoneFor = p => solo ? C.carryZones.solo : p.i ? C.carryZones.p2 : C.carryZones.p1;
+// Carry mode: which column the piece should be in, from the hands' position.
+function carryTarget(p) {
+  const pc = p.game.piece;
+  if (!pc || p.handX == null) { p.carryT = null; return null; }
+  const [z0, z1] = zoneFor(p);
+  const t = Math.max(0, Math.min(1, (p.handX - z0) / (z1 - z0)));
+  p.carryT = t;
+  let minC = 9, maxC = -1;
+  eachCell(pc.m, c => { minC = Math.min(minC, c); maxC = Math.max(maxC, c); });
+  const span = COLS - (maxC - minC + 1), u = t * span;   // continuous left-edge column
+  p.carryCenter = u + (maxC - minC + 1) / 2;            // where the hands "are", in columns (for the marker)
+  if (p.carryPiece !== pc || p.carryCol == null) { p.carryPiece = pc; p.carryCol = Math.round(u); }
+  else if (Math.abs(u - p.carryCol) > C.carryDeadband) p.carryCol = Math.round(u);
+  p.carryCol = Math.max(0, Math.min(span, p.carryCol));
+  return p.carryCol - minC;
+}
 
 async function initCamera() {
   const status = $('#camStatus');
@@ -564,7 +705,22 @@ async function initCamera() {
   }
 }
 
-// Split the detected people between the two boards by where they stand.
+// The pose model sometimes reports the same person twice, or a half-visible ghost.
+// Keep only detections with both shoulders visible, and merge ones that sit on top of each other.
+function cleanDetections(list) {
+  const W = video.videoWidth || 1280, H = video.videoHeight || 720, out = [];
+  for (const lm of list) {
+    const a = lm[11], b = lm[12];
+    if ((a.visibility ?? 1) < 0.5 || (b.visibility ?? 1) < 0.5) continue;
+    const d = { lm, x: (a.x + b.x) / 2 * W, y: (a.y + b.y) / 2 * H, sw: Math.hypot((a.x - b.x) * W, (a.y - b.y) * H) };
+    const dup = out.find(o => Math.hypot(o.x - d.x, o.y - d.y) < 0.6 * Math.max(o.sw, d.sw));
+    if (dup) { if (verbose) log('Merged a duplicate detection of the same person'); if (d.sw > dup.sw) Object.assign(dup, d); continue; }
+    out.push(d);
+  }
+  return out.map(d => d.lm);
+}
+// Split people between the boards by which half of the camera view they stand in
+// (the dashed line in the camera preview). Two people in the same half: left one is P1.
 function assign(list) {
   const dets = list.map(lm => ({ lm, x: vx((lm[11].x + lm[12].x) / 2), size: Math.hypot(lm[11].x - lm[12].x, lm[11].y - lm[12].y) }));
   const out = [null, null];
@@ -573,10 +729,7 @@ function assign(list) {
   if (dets.length >= 2) {
     dets.sort((a, b) => a.x - b.x); out[0] = dets[0].lm; out[1] = dets[dets.length - 1].lm;
   } else {
-    const d = dets[0];
-    const d0 = players[0].lastX == null ? Infinity : Math.abs(players[0].lastX - d.x);
-    const d1 = players[1].lastX == null ? Infinity : Math.abs(players[1].lastX - d.x);
-    out[d0 === Infinity && d1 === Infinity ? (d.x < 0.5 ? 0 : 1) : (d0 <= d1 ? 0 : 1)] = d.lm;
+    out[dets[0].x < 0.5 ? 0 : 1] = dets[0].lm;
   }
   return out;
 }
@@ -587,8 +740,9 @@ function pollPose(now) {
   let res;
   try { res = landmarker.detectForVideo(video, now); }
   catch (e) { if (detectErrors++ < 5) log('detectForVideo failed: ' + errStr(e), 'error'); return; }
-  const list = res.landmarks || [];
+  const list = cleanDetections(res.landmarks || []);
   if (firstDetect) { firstDetect = false; log(`Detection running (${list.length} people in first frame)`); }
+  autoMode(list, now);
   const a = assign(list);
   players.forEach((p, i) => processPlayer(p, a[i], now));
   const n = a.filter(Boolean).length;
@@ -599,6 +753,7 @@ function processPlayer(p, lm, now) {
   p.lm = lm || null;
   if (!lm) {
     if (p.seen) { p.seen = false; log(`${p.name}: out of view`); }
+    if (p.ref != null && now - p.lastSeen > C.refForgetMs) resetRef(p, 'player left');
     resetGestures(p); return;
   }
   const W = video.videoWidth, H = video.videoHeight;
@@ -616,43 +771,82 @@ function processPlayer(p, lm, now) {
   const [hL, hR] = w1.x <= w2.x ? [w1, w2] : [w2, w1];
   const S = p.S;
 
-  // Move: both hands shifted together to one side of the body.
-  const shift = hands ? ((hL.x + hR.x) / 2 - cx) / sw : 0;
-  const eR = updSw(S.moveR, hands && shift > C.moveOn && (hL.x - cx) / sw > C.moveCross, !hands || shift < C.moveOff);
-  const eL = updSw(S.moveL, hands && shift < -C.moveOn && (cx - hR.x) / sw > C.moveCross, !hands || shift > -C.moveOff);
-
-  // Rotate: tilt the "held block", one hand up and the other down.
-  // Right hand higher = right side up = counter-clockwise, like turning a wheel.
-  const tilt = hands ? (hL.y - hR.y) / sw : 0;
-  const eCcw = updSw(S.tiltCcw, hands && tilt > C.tiltOn, !hands || tilt < C.tiltOff);
-  const eCw = updSw(S.tiltCw, hands && tilt < -C.tiltOn, !hands || tilt > -C.tiltOff);
-  if (eCcw === 'rise') p.game.rotate(-1);
-  if (eCw === 'rise') p.game.rotate(1);
+  // "Holding" the block: both hands up in front, above about waist height.
+  p.holding = hands && (hL.y - shY) / sw < C.carryMaxDrop && (hR.y - shY) / sw < C.carryMaxDrop;
+  const shift = hands ? ((hL.x + hR.x) / 2 - cx) / sw : 0;   // + = both hands moved to the players' right
+  const lift = hands ? (hR.y - hL.y) / sw : 0;                // + = left hand higher than the right
 
   // Both hands above head: start / resume.
   const upL = (headY - hL.y) / sw, upR = (headY - hR.y) / sw;
   updSw(S.up, hands && upL > C.handUpOn && upR > C.handUpOn, !hands || upL < C.handUpOff || upR < C.handUpOff);
 
-  // Squat: shoulders below a "standing height" baseline that snaps up quickly and drifts down slowly.
-  if (p.standY == null) p.standY = shY;
-  const drop = (shY - p.standY) / sw;
-  const eSq = updSw(S.squat, drop > C.squatOn, drop < C.squatOff);
-  if (!S.squat.on) p.standY += (shY - p.standY) * (shY < p.standY ? 0.3 : 0.004);
+  // Squat: shoulders lower than your standing height. That reference is measured once, at the
+  // start of each game: the median shoulder height over ~0.5 s while your hands are below your
+  // shoulders. It then stays fixed (raising your arms lifts the shoulder points, so it never
+  // follows them up). Safety net: if you stand clearly taller than it for ~1.5 s, re-measure.
+  const handsRaised = hands && (hL.y < shY || hR.y < shY);
+  if (p.ref == null) {
+    if (!handsRaised) p.calib.push(shY);
+    if (p.calib.length >= C.calibFrames) {
+      const c = p.calib.slice().sort((a, b) => a - b);
+      p.ref = c[c.length >> 1]; p.calib = [];
+      log(`${p.name}: standing height set`);
+    }
+  }
+  const drop = p.ref == null ? 0 : (shY - p.ref) / sw;
+  const eSq = updSw(S.squat, p.ref != null && drop > C.squatOn, p.ref == null || drop < C.squatOff);
+  if (p.ref != null && !handsRaised && drop < -C.squatOff) {
+    if (++p.tallN > C.calibFrames * 3) resetRef(p, 'standing taller than measured');
+  } else p.tallN = 0;
+
+  // Carry mode: the block follows the hands' position (never while squatting).
+  if (p.holding && !S.squat.on) {
+    const mx = (hL.x + hR.x) / 2 / W;
+    p.handX = p.handX == null ? mx : p.handX + (mx - p.handX) * C.carrySmoothing;
+  } else p.handX = null;
+
+  // One gesture = one action, then back to HOME before anything else counts.
+  // HOME = hands up in front, level, centred (carry mode: just level, since moving is continuous).
+  // From home, whichever gesture crosses its threshold first wins: sideways = move, lift = rotate.
+  // Squatting (or dropping your arms) cancels everything until you're back home.
+  const carry = C.scheme === 'carry';
+  const atHome = p.holding && Math.abs(lift) < C.homeLevel && (carry || Math.abs(shift) < C.homeShift);
+  let action = null;
+  if (S.squat.on || !p.holding) { p.armed = false; p.homeN = 0; p.gestN = 0; }
+  else if (!p.armed) {
+    p.homeN = atHome ? p.homeN + 1 : 0;
+    if (p.homeN >= C.confirmFrames) { p.armed = true; p.gestN = 0; }
+  } else {
+    const sScore = carry ? 0 : Math.abs(shift) / C.stepOn, rScore = Math.abs(lift) / C.liftOn;
+    p.gestN = sScore >= 1 || rScore >= 1 ? p.gestN + 1 : 0;
+    if (p.gestN >= C.confirmFrames) {
+      action = sScore >= rScore ? (shift > 0 ? 'right' : 'left') : (lift > 0 ? 'cw' : 'ccw');
+      p.armed = false; p.homeN = 0; p.gestN = 0; p.flash = { action, t: now };
+      if (action === 'left') p.game.move(-1);
+      else if (action === 'right') p.game.move(1);
+      else p.game.rotate(action === 'cw' ? 1 : -1);
+    }
+  }
 
   if (verbose) {
-    const ev = [eL === 'rise' && 'move ◀', eR === 'rise' && 'move ▶', eCcw === 'rise' && 'rotate ↺', eCw === 'rise' && 'rotate ↻', eSq === 'rise' && 'squat'].filter(Boolean);
-    if (ev.length) log(`${p.name}: ${ev.join(', ')}  (shift ${shift.toFixed(2)}, tilt ${tilt.toFixed(2)}, squat ${drop.toFixed(2)})`);
+    if (action) log(`${p.name}: ${action}  (shift ${shift.toFixed(2)}/${C.stepOn}, lift ${lift.toFixed(2)}/${C.liftOn})`);
+    if (eSq === 'rise') log(`${p.name}: squat (${drop.toFixed(2)})`);
+    if (!!p.armed !== !!p.wasArmed) log(`${p.name}: ${p.armed ? 'home, ready' : 'waiting for home'}`);
   }
-  p.dbg = { hands, hLi: hL.i, hRi: hR.i, shift, tilt, drop, upL, upR };
+  p.wasArmed = p.armed;
+  p.dbg = { hands, hLi: hL.i, hRi: hR.i, shift, lift, drop };
 }
 
 function applyPlayer(p, now) {
   const g = p.game, S = p.S;
-  // Held shift -> move with auto-repeat
-  const want = S.moveL.on && !S.moveR.on ? -1 : S.moveR.on && !S.moveL.on ? 1 : 0;
-  const dir = g.playing ? want : 0;
-  if (dir !== p.moveDir) { p.moveDir = dir; if (dir) { g.move(dir); p.moveNext = now + C.das; } }
-  else if (dir && now >= p.moveNext) { g.move(dir); p.moveNext = now + C.arr; }
+  let want = 0;
+  if (C.scheme === 'carry') {
+    // Slide the piece toward the column under the hands, one step at a time (respects walls/blocks).
+    const tx = carryTarget(p);
+    if (g.playing && tx != null && !S.squat.on) want = Math.sign(tx - g.piece.x);
+    if (want && now >= p.moveNext) { g.move(want); p.moveNext = now + C.carryStepMs; }
+  } else {
+  }
 
   if (S.squat.on && g.playing && now >= p.softNext) { g.softDrop(); p.softNext = now + C.softDropMs; }
 
@@ -667,14 +861,19 @@ function applyPlayer(p, now) {
   }
   if (g.state === 'playing' && poseReady && now - p.lastSeen > C.lostPauseMs) g.pause('Lost sight of you.');
 
-  const c = p.chips;
-  c.left.classList.toggle('on', want === -1);
-  c.right.classList.toggle('on', want === 1);
-  c.ccw.classList.toggle('on', S.tiltCcw.on);
-  c.cw.classList.toggle('on', S.tiltCw.on);
+  const c = p.chips, fl = p.flash && now - p.flash.t < 300 ? p.flash.action : null;
+  c.left.classList.toggle('on', fl === 'left' || want === -1);
+  c.right.classList.toggle('on', fl === 'right' || want === 1);
+  c.ccw.classList.toggle('on', fl === 'ccw');
+  c.cw.classList.toggle('on', fl === 'cw');
   c.squat.classList.toggle('on', S.squat.on);
-  p.dbgEl.textContent = showDbg && p.dbg
-    ? `shift ${p.dbg.shift.toFixed(2)} (>${C.moveOn})\ntilt  ${p.dbg.tilt.toFixed(2)} (>${C.tiltOn})\nsquat ${p.dbg.drop.toFixed(2)} (>${C.squatOn})`
+  const d = p.dbg;
+  p.dbgEl.textContent = showDbg && d
+    ? `${p.armed ? 'HOME ✓ ready' : 'back to home'}\n` +
+      (C.scheme === 'carry'
+        ? `hands ${p.carryT == null ? '-' : (p.carryT * 100).toFixed(0) + '%'}\n`
+        : `shift ${d.shift.toFixed(2)} (>${C.stepOn})\n`) +
+      `lift  ${d.lift.toFixed(2)} (>${C.liftOn})\nsquat ${d.drop.toFixed(2)} (>${C.squatOn})`
     : '';
 }
 
@@ -695,6 +894,19 @@ function drawCam() {
     ctx.fillStyle = PCOLORS[0]; ctx.textAlign = 'left'; ctx.fillText('P1', 8, 6);
     ctx.fillStyle = PCOLORS[1]; ctx.textAlign = 'right'; ctx.fillText('P2', w - 8, 6);
   }
+  if (C.scheme === 'carry') {
+    // Each player's carry zone: the strip of floor/air that maps onto their 10 columns.
+    for (const p of players) {
+      if (solo && p.i) continue;
+      const [z0, z1] = zoneFor(p), y = h - 14;
+      ctx.strokeStyle = p.color; ctx.fillStyle = p.color; ctx.lineWidth = 3; ctx.globalAlpha = 0.7;
+      ctx.beginPath(); ctx.moveTo(z0 * w, y - 8); ctx.lineTo(z0 * w, y); ctx.lineTo(z1 * w, y); ctx.lineTo(z1 * w, y - 8); ctx.stroke();
+      ctx.lineWidth = 1;
+      for (let c = 1; c < COLS; c++) { const x = (z0 + (z1 - z0) * c / COLS) * w; ctx.beginPath(); ctx.moveTo(x, y - 4); ctx.lineTo(x, y); ctx.stroke(); }
+      ctx.globalAlpha = 1;
+      if (p.handX != null) { ctx.beginPath(); ctx.arc(Math.max(z0, Math.min(z1, p.handX)) * w, y, 7, 0, 7); ctx.fill(); }
+    }
+  }
   for (const p of players) if (p.lm) drawSkeleton(p, w, h);
 }
 function drawSkeleton(p, w, h) {
@@ -712,7 +924,7 @@ function drawSkeleton(p, w, h) {
   if (d && d.hands) {
     const ax = X(d.hLi), ay = Y(d.hLi), bx = X(d.hRi), by = Y(d.hRi);
     const s = Math.max(16, Math.hypot(bx - ax, by - ay) * 0.45);
-    const S = p.S, col = S.moveL.on || S.moveR.on ? '#3cff9e' : S.tiltCcw.on || S.tiltCw.on ? '#ffd84d' : p.color;
+    const col = handColor(p);
     ctx.save(); ctx.translate((ax + bx) / 2, (ay + by) / 2); ctx.rotate(Math.atan2(by - ay, bx - ax));
     ctx.fillStyle = col; ctx.globalAlpha = 0.55; ctx.fillRect(-s / 2, -s / 2, s, s);
     ctx.globalAlpha = 1; ctx.strokeStyle = col; ctx.lineWidth = 3; ctx.strokeRect(-s / 2, -s / 2, s, s);
@@ -742,8 +954,9 @@ addEventListener('keydown', e => {
   const active = solo ? [players[0]] : players;
   if (k === 'f') { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {}); return; }
   if (k === 'm') { swapLR = !swapLR; log('Sides ' + (swapLR ? 'swapped' : 'normal')); return; }
+  if (k === 'c') { setScheme(C.scheme === 'carry' ? 'step' : 'carry'); return; }
   if (k === 'b') { showDbg = verbose = !showDbg; log('Gesture debug ' + (verbose ? 'on' : 'off')); return; }
-  if (k === '1' || k === '2') { setMode(k === '1'); return; }
+  if (k === '0' || k === '1' || k === '2') { setModeSetting(k === '0' ? 'auto' : k === '1' ? 'solo' : 'duo'); return; }
   if (k === 'p') {
     const anyPlaying = active.some(p => p.game.state === 'playing');
     active.forEach(p => anyPlaying ? p.game.pause() : p.game.resume()); return;
@@ -771,7 +984,24 @@ function frame(now) {
   drawCam();
   requestAnimationFrame(frame);
 }
+function setScheme(s) {
+  C.scheme = s;
+  try { localStorage.setItem('wallfall-scheme', s); } catch (e) {}
+  $('#howto').innerHTML =
+    `<b>HOME</b>: both hands up in front of you, level.<br>
+     From home, do <b>one</b> gesture, then go back home:<br>` +
+    (s === 'carry'
+      ? `<b>Carry</b>: the block follows your hands left / right<br>`
+      : `<b>Both hands sideways</b>: move one column<br>`) +
+    `<b>Lift left hand</b>: rotate ↻ · <b>lift right hand</b>: rotate ↺<br>
+     <b>Squat</b>: drop faster (nothing else counts while squatting)<br>
+     <b>Both hands above your head</b>: start / resume
+     <div class="label" style="margin-top:.8vh">Controls: ${s} · C to switch</div>`;
+  log(`Controls: ${s}`);
+}
 addEventListener('resize', resize);
+try { const s = localStorage.getItem('wallfall-scheme'); if (s === 'carry' || s === 'step') C.scheme = s; } catch (e) {}
+setScheme(C.scheme);
 setMode(solo);
 requestAnimationFrame(frame);
 initCamera();
