@@ -1,0 +1,780 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallfall</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #07070d; --panel: #10111b; --line: #262842; --text: #f2f3ff;
+    --muted: #8a8fb3; --accent: #ffd84d; --on: #3cff9e; --warn: #ff5f7a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  #app { display: flex; justify-content: center; align-items: center; gap: 1.5vw; height: 100vh; padding: 2vh 1.5vw; }
+
+  .player { display: flex; align-items: center; gap: 1.2vw; }
+  .player.right { flex-direction: row-reverse; }
+  body.solo .player.p2 { display: none; }
+  .side { width: 11vw; display: flex; flex-direction: column; gap: 1.6vh; }
+  body.solo .side { width: 16vw; }
+  .tag { font-size: 5vh; font-weight: 900; letter-spacing: .1em; color: var(--pc); line-height: 1; }
+  body.solo .tag { display: none; }
+  .card { background: var(--panel); border: 2px solid var(--line); border-radius: 12px; padding: 1.2vh .9vw; }
+  .label { color: var(--muted); font-size: 1.5vh; text-transform: uppercase; letter-spacing: .15em; }
+  .value { font-size: 4.2vh; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.15; }
+  .value.small { font-size: 3vh; }
+  .row { display: flex; justify-content: space-between; gap: .5vw; margin-top: .8vh; }
+  canvas.next { display: block; width: 100%; }
+  .chips { display: grid; grid-template-columns: 1fr 1fr; gap: .8vh .4vw; }
+  .chip { text-align: center; font-weight: 800; font-size: 2.6vh; padding: .9vh .2vw; border-radius: 10px;
+    border: 2px solid var(--line); color: var(--muted); transition: background .08s, color .08s; }
+  .chip.wide { grid-column: span 2; font-size: 1.9vh; }
+  .chip.on { background: var(--on); border-color: var(--on); color: #04130b; }
+  .dbgtxt { font: 1.4vh/1.4 ui-monospace, monospace; color: var(--muted); white-space: pre; }
+
+  .boardWrap { position: relative; flex: none; }
+  canvas.board { display: block; border-radius: 10px; box-shadow: 0 0 0 3px var(--pc), 0 0 70px var(--glow); }
+  .overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; text-align: center; gap: 1.8vh; padding: 1.2vw;
+    background: rgba(7, 7, 13, .8); border-radius: 10px; }
+  .overlay.hidden { display: none; }
+  .ovTitle { font-size: 5vh; font-weight: 900; letter-spacing: .06em; color: var(--pc); }
+  .ovSub { font-size: 2.2vh; color: var(--muted); line-height: 1.5; }
+  .ovSub b { color: var(--accent); }
+  .hold { width: 70%; height: 1.2vh; background: var(--line); border-radius: 99px; overflow: hidden; }
+  .holdFill { height: 100%; width: 0; background: var(--on); }
+
+  .center { width: 20vw; display: flex; flex-direction: column; gap: 1.6vh; }
+  body.solo .center { width: 24vw; }
+  h1 { margin: 0; font-size: 5.5vh; letter-spacing: .12em; font-weight: 900; text-align: center;
+    background: linear-gradient(90deg, #ff5fa2, #ffd84d, #5ce1e6); -webkit-background-clip: text;
+    background-clip: text; color: transparent; }
+  #cam { display: block; width: 100%; border-radius: 12px; background: #000; border: 2px solid var(--line); }
+  #camStatus { font-size: 1.8vh; color: var(--muted); min-height: 2.2vh; text-align: center; }
+  #camStatus.err { color: var(--warn); }
+  .howto { font-size: 1.9vh; line-height: 1.55; }
+  .howto b { color: var(--accent); }
+  .best { display: flex; justify-content: space-between; align-items: baseline; }
+  .keys { font-size: 1.4vh; color: var(--muted); line-height: 1.5; }
+  video { display: none; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="center">
+    <h1>WALLFALL</h1>
+    <canvas id="cam" width="480" height="270"></canvas>
+    <div id="camStatus">Starting camera…</div>
+    <div class="card howto">
+      Hold your hands out in front, <b>as if holding the block</b>.<br>
+      <b>Shift both hands</b> left / right: move<br>
+      <b>Tilt it</b> (one hand up, one down): rotate<br>
+      <b>Squat</b>: drop faster<br>
+      <b>Both hands above your head</b>: start / resume
+    </div>
+    <div class="card best"><span class="label">Best</span><span class="value small" id="best">0</span></div>
+    <div class="keys">Keys: P1 A/D move · W/Q rotate · S drop — P2 ←→ move · ↑ rotate · ↓ drop<br>
+      Enter start · P pause · 1/2 players · F fullscreen · M swap sides · B gesture debug</div>
+  </div>
+</div>
+<video id="video" playsinline muted></video>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ---------------------------------------------------------------------------
+// Tuning. Distances are in "shoulder widths" so they work at any distance
+// from the camera. Raise the *On values to demand wider/bigger gestures.
+// ---------------------------------------------------------------------------
+const C = {
+  moveOn: 1.0,      // midpoint of both hands this far left/right of the body -> move
+  moveOff: 0.6,     // ...and must come back inside this to stop
+  moveCross: 0.1,   // the trailing hand must also be past the body centre (so one arm alone doesn't count)
+  tiltOn: 1.0,      // height difference between the hands -> rotate (once per tilt)
+  tiltOff: 0.35,    // hands must level out below this before the next rotation
+  handUpOn: 0.25,   // both wrists this far above the nose -> "hands up" (start / resume)
+  handUpOff: -0.05,
+  squatOn: 0.55,    // shoulders this far below standing height -> squat
+  squatOff: 0.30,
+  confirmFrames: 2, // a pose must hold this many camera frames to count (kills jitter)
+  das: 320,         // ms before a held shift starts auto-repeating
+  arr: 130,         // ms between repeated moves while the hands stay shifted
+  softDropMs: 55,   // ms per row while squatting
+  startHoldMs: 700, // hold both hands up this long to start / resume
+  lostPauseMs: 2000,// auto-pause a player's game after they've been out of view this long
+  startGravity: 1000, minGravity: 90, gravityFactor: 0.85, // ms per row
+  lockDelay: 500, maxLockResets: 15, clearMs: 260,
+};
+
+const WASM_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
+const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+
+const COLS = 10, ROWS = 20;
+const SHAPES = {
+  I: [[0,0,0,0],[1,1,1,1],[0,0,0,0],[0,0,0,0]],
+  O: [[1,1],[1,1]],
+  T: [[0,1,0],[1,1,1],[0,0,0]],
+  S: [[0,1,1],[1,1,0],[0,0,0]],
+  Z: [[1,1,0],[0,1,1],[0,0,0]],
+  J: [[1,0,0],[1,1,1],[0,0,0]],
+  L: [[0,0,1],[1,1,1],[0,0,0]],
+};
+const COLORS = { I:'#ff5fa2', O:'#ffd84d', T:'#5ce1e6', S:'#a77bff', Z:'#ff8a3d', J:'#6bff8f', L:'#4f8bff' };
+const KICKS = [[0,0],[-1,0],[1,0],[-2,0],[2,0],[0,-1]];
+const PCOLORS = ['#ff5fa2', '#5ce1e6'];
+const PGLOWS = ['rgba(255,95,162,.15)', 'rgba(92,225,230,.15)'];
+
+const $ = s => document.querySelector(s);
+const camCv = $('#cam'), cctx = camCv.getContext('2d');
+const video = $('#video');
+
+// ---------------------------------------------------------------------------
+// Logging: browser console + the terminal running serve.py (POST /log).
+// ---------------------------------------------------------------------------
+let termOK = true, termQueue = [], termTimer = null, verbose = false;
+function errStr(e) {
+  if (e == null) return String(e);
+  if (typeof e === 'string') return e;
+  if (typeof Event !== 'undefined' && e instanceof Event) return `Event(${e.type}) from ${e.target?.src || e.target?.tagName || '?'}`;
+  return `${e.name || 'Error'}: ${e.message || String(e)}`;
+}
+function log(msg, level = 'info') {
+  const line = `${(performance.now() / 1000).toFixed(1).padStart(6)}s ${level === 'info' ? '' : level.toUpperCase() + ' '}${msg}`;
+  (console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log'])('[wallfall] ' + line);
+  if (!termOK) return;
+  termQueue.push(line);
+  termTimer ??= setTimeout(flushTerm, 150);
+}
+function flushTerm() {
+  termTimer = null;
+  if (!termQueue.length) return;
+  const body = termQueue.join('\n'); termQueue = [];
+  fetch('/log', { method: 'POST', body, keepalive: true, headers: { 'Content-Type': 'text/plain' } })
+    .then(r => { if (!r.ok) { termOK = false; console.warn('[wallfall] terminal logging off: start the game with serve.py'); } })
+    .catch(() => { termOK = false; });
+}
+addEventListener('error', e => log('Uncaught: ' + errStr(e.error || e.message), 'error'));
+addEventListener('unhandledrejection', e => log('Unhandled promise: ' + errStr(e.reason), 'error'));
+
+// ---------------------------------------------------------------------------
+// Sound (tiny synth blips; unlocked on first key/click)
+// ---------------------------------------------------------------------------
+let actx = null;
+function unlockAudio() {
+  try {
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === 'suspended') actx.resume();
+  } catch (e) {}
+}
+function beep(f, d = 0.06, type = 'square', vol = 0.04) {
+  if (!actx || actx.state !== 'running') return;
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = type; o.frequency.value = f;
+  g.gain.setValueAtTime(vol, actx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + d);
+  o.connect(g).connect(actx.destination);
+  o.start(); o.stop(actx.currentTime + d);
+}
+
+// ---------------------------------------------------------------------------
+// Game logic (one instance per player)
+// ---------------------------------------------------------------------------
+let best = 0;
+try { best = +localStorage.getItem('wallfall-best') || 0; } catch (e) {}
+const newBoard = () => Array.from({ length: ROWS }, () => Array(COLS).fill(null));
+function rotateM(m, dir) {
+  const n = m.length;
+  return m.map((row, r) => row.map((_, c) => dir > 0 ? m[n - 1 - c][r] : m[c][n - 1 - r]));
+}
+
+class Game {
+  constructor(p) { this.p = p; this.reset(); this.state = 'title'; }
+  reset() {
+    this.board = newBoard(); this.bag = []; this.piece = null; this.next = null;
+    this.score = 0; this.lines = 0; this.level = 1; this.clearing = null; this.popup = null;
+    this.dropAcc = 0; this.lockAcc = 0; this.lockResets = 0;
+  }
+  nextType() {
+    if (!this.bag.length) {
+      const b = Object.keys(SHAPES);
+      for (let i = b.length - 1; i > 0; i--) { const j = Math.random() * (i + 1) | 0; [b[i], b[j]] = [b[j], b[i]]; }
+      this.bag = b;
+    }
+    return this.bag.pop();
+  }
+  get playing() { return this.state === 'playing' && !!this.piece && !this.clearing; }
+  collide(m, px, py) {
+    for (let r = 0; r < m.length; r++) for (let c = 0; c < m.length; c++) {
+      if (!m[r][c]) continue;
+      const x = px + c, y = py + r;
+      if (x < 0 || x >= COLS || y >= ROWS) return true;
+      if (y >= 0 && this.board[y][x]) return true;
+    }
+    return false;
+  }
+  gravityMs() { return Math.max(C.minGravity, C.startGravity * Math.pow(C.gravityFactor, this.level - 1)); }
+  start() {
+    this.reset(); this.next = this.nextType(); this.state = 'playing';
+    hideOverlay(this.p); this.spawn(); updateHUD(this.p);
+    beep(660, .12, 'triangle', .06); log(`${this.p.name}: game started`);
+  }
+  spawn() {
+    const type = this.next; this.next = this.nextType();
+    const m = SHAPES[type].map(r => r.slice());
+    this.piece = { type, m, x: Math.floor((COLS - m.length) / 2), y: type === 'I' ? -1 : 0 };
+    this.dropAcc = 0; this.lockAcc = 0; this.lockResets = 0;
+    drawNext(this.p);
+    if (this.collide(m, this.piece.x, this.piece.y)) this.gameOver();
+  }
+  tryMove(dx, dy) {
+    const p = this.piece;
+    if (this.collide(p.m, p.x + dx, p.y + dy)) return false;
+    p.x += dx; p.y += dy; return true;
+  }
+  resetLock() {
+    const p = this.piece;
+    if (this.collide(p.m, p.x, p.y + 1) && this.lockResets < C.maxLockResets) { this.lockAcc = 0; this.lockResets++; }
+  }
+  move(dir) {
+    if (!this.playing) return;
+    if (this.tryMove(dir, 0)) { this.resetLock(); beep(220, .03); }
+  }
+  rotate(dir) {
+    if (!this.playing || this.piece.type === 'O') return;
+    const p = this.piece, m = rotateM(p.m, dir);
+    for (const [kx, ky] of KICKS) {
+      if (!this.collide(m, p.x + kx, p.y + ky)) {
+        p.m = m; p.x += kx; p.y += ky; this.resetLock(); beep(440, .04); return;
+      }
+    }
+  }
+  softDrop() {
+    if (!this.playing) return;
+    if (this.tryMove(0, 1)) { this.score += 1; this.dropAcc = 0; updateHUD(this.p); }
+  }
+  lock() {
+    const { m, x: px, y: py, type } = this.piece;
+    for (let r = 0; r < m.length; r++) for (let c = 0; c < m.length; c++) {
+      if (!m[r][c]) continue;
+      if (py + r < 0) { this.gameOver(); return; }
+      this.board[py + r][px + c] = type;
+    }
+    this.piece = null;
+    const full = [];
+    this.board.forEach((row, y) => { if (row.every(Boolean)) full.push(y); });
+    if (full.length) {
+      this.score += [0, 100, 300, 500, 800][full.length] * this.level;
+      this.clearing = { rows: full, t: 0 };
+      this.popup = { text: ['', 'SINGLE', 'DOUBLE', 'TRIPLE', '4 LINES!'][full.length], t: 0 };
+      [523, 659, 784, 1047].slice(0, full.length).forEach((f, i) => setTimeout(() => beep(f, .1, 'triangle', .06), i * 70));
+    } else {
+      this.spawn();
+    }
+    updateHUD(this.p);
+  }
+  update(dt) {
+    if (this.popup && (this.popup.t += dt) > 900) this.popup = null;
+    if (this.state !== 'playing') return;
+    if (this.clearing) {
+      this.clearing.t += dt;
+      if (this.clearing.t >= C.clearMs) {
+        const rows = this.clearing.rows;
+        this.board = this.board.filter((_, y) => !rows.includes(y));
+        while (this.board.length < ROWS) this.board.unshift(Array(COLS).fill(null));
+        const oldLevel = this.level;
+        this.lines += rows.length; this.level = 1 + Math.floor(this.lines / 10);
+        if (this.level > oldLevel) { this.popup = { text: 'LEVEL ' + this.level, t: 0 }; log(`${this.p.name}: level ${this.level}`); }
+        this.clearing = null; updateHUD(this.p); this.spawn();
+      }
+      return;
+    }
+    const p = this.piece;
+    if (!p) return;
+    if (this.collide(p.m, p.x, p.y + 1)) {
+      this.lockAcc += dt;
+      if (this.lockAcc >= C.lockDelay) this.lock();
+    } else {
+      this.lockAcc = 0; this.dropAcc += dt;
+      const g = this.gravityMs();
+      while (this.dropAcc >= g) { this.dropAcc -= g; if (!this.tryMove(0, 1)) break; }
+    }
+  }
+  gameOver() {
+    this.state = 'over'; this.piece = null; this.p.needLower = true;
+    if (this.score > best) { best = this.score; try { localStorage.setItem('wallfall-best', best); } catch (e) {} }
+    updateHUD(this.p);
+    showOverlay(this.p, 'GAME OVER', `Score <b>${this.score}</b><br>Lower your arms, then<br><b>raise both hands &amp; hold</b><br>to play again.`);
+    beep(196, .4, 'sawtooth', .06);
+    log(`${this.p.name}: game over (score ${this.score}, lines ${this.lines}, level ${this.level})`);
+  }
+  pause(reason) {
+    if (this.state !== 'playing') return;
+    this.state = 'paused';
+    showOverlay(this.p, 'PAUSED', `${reason ? reason + '<br>' : ''}<b>Raise both hands &amp; hold</b> to resume.`);
+    log(`${this.p.name}: paused${reason ? ' (' + reason + ')' : ''}`);
+  }
+  resume() {
+    if (this.state !== 'paused') return;
+    this.state = 'playing'; hideOverlay(this.p); this.p.lastSeen = performance.now();
+    log(`${this.p.name}: resumed`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Players: DOM + gesture state + game
+// ---------------------------------------------------------------------------
+let solo = false;
+try { solo = localStorage.getItem('wallfall-mode') === '1'; } catch (e) {}
+const mkSw = () => ({ on: false, n: 0 });
+
+function makePlayer(i) {
+  const el = document.createElement('section');
+  el.className = `player p${i + 1}${i ? ' right' : ''}`;
+  el.style.setProperty('--pc', PCOLORS[i]);
+  el.style.setProperty('--glow', PGLOWS[i]);
+  el.innerHTML = `
+    <div class="side">
+      <div class="tag">P${i + 1}</div>
+      <div class="card">
+        <div class="label">Score</div><div class="value" data-k="score">0</div>
+        <div class="row">
+          <div><div class="label">Level</div><div class="value small" data-k="level">1</div></div>
+          <div><div class="label">Lines</div><div class="value small" data-k="lines">0</div></div>
+        </div>
+      </div>
+      <div class="card"><div class="label">Next</div><canvas class="next"></canvas></div>
+      <div class="chips">
+        <div class="chip" data-c="left">◀</div><div class="chip" data-c="right">▶</div>
+        <div class="chip" data-c="ccw">↺</div><div class="chip" data-c="cw">↻</div>
+        <div class="chip wide" data-c="squat">▼ SQUAT</div>
+      </div>
+      <div class="dbgtxt"></div>
+    </div>
+    <div class="boardWrap">
+      <canvas class="board"></canvas>
+      <div class="overlay"><div class="ovTitle"></div><div class="ovSub"></div><div class="hold"><div class="holdFill"></div></div></div>
+    </div>`;
+  const q = s => el.querySelector(s);
+  const p = {
+    i, name: 'P' + (i + 1), color: PCOLORS[i], el,
+    boardCv: q('canvas.board'), nextCv: q('canvas.next'),
+    ov: q('.overlay'), ovTitle: q('.ovTitle'), ovSub: q('.ovSub'), holdFill: q('.holdFill'), dbgEl: q('.dbgtxt'),
+    hud: { score: q('[data-k=score]'), level: q('[data-k=level]'), lines: q('[data-k=lines]') },
+    chips: Object.fromEntries([...el.querySelectorAll('[data-c]')].map(c => [c.dataset.c, c])),
+    S: { moveL: mkSw(), moveR: mkSw(), tiltCcw: mkSw(), tiltCw: mkSw(), up: mkSw(), squat: mkSw() },
+    standY: null, moveDir: 0, moveNext: 0, softNext: 0, holdStart: null, needLower: false,
+    lastSeen: 0, lastX: null, seen: false, lm: null, dbg: null,
+  };
+  p.bctx = p.boardCv.getContext('2d'); p.nctx = p.nextCv.getContext('2d');
+  p.game = new Game(p);
+  return p;
+}
+const players = [makePlayer(0), makePlayer(1)];
+$('#app').prepend(players[0].el);
+$('#app').append(players[1].el);
+
+function updateHUD(p) {
+  const g = p.game;
+  p.hud.score.textContent = g.score; p.hud.level.textContent = g.level; p.hud.lines.textContent = g.lines;
+  $('#best').textContent = Math.max(best, ...players.map(q => q.game.score));
+}
+function showOverlay(p, title, sub) {
+  p.ovTitle.textContent = title; p.ovSub.innerHTML = sub;
+  p.ov.classList.remove('hidden'); setHold(p, 0);
+}
+function hideOverlay(p) { p.ov.classList.add('hidden'); }
+function setHold(p, v) { p.holdFill.style.width = Math.max(0, Math.min(1, v)) * 100 + '%'; }
+function titleOverlay(p) {
+  const where = solo ? 'Stand in front of the camera' : `Stand on the <b>${p.i ? 'right' : 'left'}</b> side`;
+  showOverlay(p, solo ? 'WALLFALL' : p.name, `${where},<br>then <b>raise both hands &amp; hold</b><br>to start.`);
+}
+function setMode(isSolo) {
+  solo = isSolo;
+  document.body.classList.toggle('solo', solo);
+  try { localStorage.setItem('wallfall-mode', solo ? '1' : '2'); } catch (e) {}
+  if (solo) { players[1].game.reset(); players[1].game.state = 'title'; resetGestures(players[1]); players[1].lm = null; }
+  players.forEach(p => { if (p.game.state === 'title') titleOverlay(p); updateHUD(p); });
+  resize();
+  log(`Mode: ${solo ? '1 player' : '2 players'}`);
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+let cell = 30;
+function resize() {
+  const dpr = window.devicePixelRatio || 1, W = innerWidth, H = innerHeight;
+  cell = Math.floor(Math.min(H * 0.92 / ROWS, solo ? W * 0.40 / COLS : W * 0.43 / 2 / COLS));
+  for (const p of players) {
+    const w = COLS * cell, h = ROWS * cell;
+    p.boardCv.width = w * dpr; p.boardCv.height = h * dpr;
+    p.boardCv.style.width = w + 'px'; p.boardCv.style.height = h + 'px';
+    p.bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const nw = p.nextCv.clientWidth || 150, nh = nw * 0.55;
+    p.nextCv.width = nw * dpr; p.nextCv.height = nh * dpr; p.nextCv.style.height = nh + 'px';
+    p.nctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    drawNext(p);
+  }
+}
+function shade(hex, amt) {
+  const n = parseInt(hex.slice(1), 16);
+  let r = n >> 16, g = (n >> 8) & 255, b = n & 255;
+  const t = amt > 0 ? 255 : 0, a = Math.abs(amt);
+  r = Math.round(r + (t - r) * a); g = Math.round(g + (t - g) * a); b = Math.round(b + (t - b) * a);
+  return `rgb(${r},${g},${b})`;
+}
+function drawBlock(ctx, x, y, s, color, ghost = false) {
+  const p = Math.max(1, s * 0.06), r = s * 0.2;
+  ctx.beginPath(); ctx.roundRect(x + p, y + p, s - 2 * p, s - 2 * p, r);
+  if (ghost) {
+    ctx.globalAlpha = 0.5; ctx.strokeStyle = color; ctx.lineWidth = Math.max(2, s * 0.08); ctx.stroke();
+    ctx.globalAlpha = 1; return;
+  }
+  const g = ctx.createLinearGradient(x, y, x, y + s);
+  g.addColorStop(0, shade(color, 0.3)); g.addColorStop(1, shade(color, -0.25));
+  ctx.fillStyle = g; ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,.28)';
+  ctx.beginPath(); ctx.roundRect(x + s * 0.22, y + s * 0.15, s * 0.56, s * 0.13, s * 0.065); ctx.fill();
+}
+function eachCell(m, fn) {
+  for (let r = 0; r < m.length; r++) for (let c = 0; c < m.length; c++) if (m[r][c]) fn(c, r);
+}
+function drawBoard(p) {
+  const g = p.game, W = COLS * cell, H = ROWS * cell, ctx = p.bctx;
+  ctx.fillStyle = '#0c0d17'; ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = 'rgba(255,255,255,.045)'; ctx.lineWidth = 1;
+  for (let x = 1; x < COLS; x++) { ctx.beginPath(); ctx.moveTo(x * cell + .5, 0); ctx.lineTo(x * cell + .5, H); ctx.stroke(); }
+  for (let y = 1; y < ROWS; y++) { ctx.beginPath(); ctx.moveTo(0, y * cell + .5); ctx.lineTo(W, y * cell + .5); ctx.stroke(); }
+  for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++)
+    if (g.board[y][x]) drawBlock(ctx, x * cell, y * cell, cell, COLORS[g.board[y][x]]);
+  if (g.clearing) {
+    ctx.fillStyle = `rgba(255,255,255,${0.5 + 0.5 * Math.sin(g.clearing.t / 30)})`;
+    for (const y of g.clearing.rows) ctx.fillRect(0, y * cell, W, cell);
+  }
+  const pc = g.piece;
+  if (pc) {
+    let gy = pc.y; while (!g.collide(pc.m, pc.x, gy + 1)) gy++;
+    eachCell(pc.m, (c, r) => { if (gy + r >= 0) drawBlock(ctx, (pc.x + c) * cell, (gy + r) * cell, cell, COLORS[pc.type], true); });
+    eachCell(pc.m, (c, r) => { if (pc.y + r >= 0) drawBlock(ctx, (pc.x + c) * cell, (pc.y + r) * cell, cell, COLORS[pc.type]); });
+  }
+  if (g.popup) {
+    const k = g.popup.t / 900;
+    ctx.save(); ctx.globalAlpha = 1 - k * k;
+    ctx.font = `900 ${cell * 1.2}px system-ui, sans-serif`; ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffd84d'; ctx.shadowColor = p.color; ctx.shadowBlur = 20;
+    ctx.fillText(g.popup.text, W / 2, H * 0.4 - k * cell * 2);
+    ctx.restore();
+  }
+}
+function drawNext(p) {
+  const w = p.nextCv.clientWidth, h = w * 0.55, ctx = p.nctx, t = p.game.next;
+  ctx.clearRect(0, 0, w, h);
+  if (!t) return;
+  const m = SHAPES[t], s = Math.min(w / 5, h / 2.8);
+  let minC = 9, maxC = -1, minR = 9, maxR = -1;
+  eachCell(m, (c, r) => { minC = Math.min(minC, c); maxC = Math.max(maxC, c); minR = Math.min(minR, r); maxR = Math.max(maxR, r); });
+  const pw = (maxC - minC + 1) * s, ph = (maxR - minR + 1) * s;
+  eachCell(m, (c, r) => drawBlock(ctx, w / 2 - pw / 2 + (c - minC) * s, h / 2 - ph / 2 + (r - minR) * s, s, COLORS[t]));
+}
+
+// ---------------------------------------------------------------------------
+// Pose tracking -> gestures
+// ---------------------------------------------------------------------------
+let landmarker = null, lastVideoTime = -1, poseReady = false, swapLR = false, showDbg = false;
+let detectErrors = 0, firstDetect = true;
+// Horizontal coordinate as the players see it: 0 = their left, 1 = their right.
+// With the camera facing the players this is the mirrored image; M flips it.
+const vx = x => swapLR ? x : 1 - x;
+
+function updSw(s, onCond, offCond) {
+  if (!s.on) {
+    if (onCond) { if (++s.n >= C.confirmFrames) { s.on = true; s.n = 0; return 'rise'; } } else s.n = 0;
+  } else {
+    if (offCond) { if (++s.n >= C.confirmFrames) { s.on = false; s.n = 0; return 'fall'; } } else s.n = 0;
+  }
+  return null;
+}
+function resetGestures(p) { for (const k in p.S) { p.S[k].on = false; p.S[k].n = 0; } p.standY = null; p.dbg = null; }
+
+async function initCamera() {
+  const status = $('#camStatus');
+  log(`Page ${location.href} | secureContext=${window.isSecureContext}`);
+  log(`Browser: ${navigator.userAgent.replace(/^Mozilla\/5\.0 /, '')}`);
+  if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+    log('navigator.mediaDevices unavailable: insecure context', 'error');
+    status.innerHTML = `Camera blocked on ${location.origin}.<br>Open <b>http://localhost:${location.port || 8000}</b> instead.`;
+    status.classList.add('err'); return;
+  }
+  try {
+    let stream;
+    try { stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' }, audio: false }); }
+    catch (e) { log('Camera: preferred settings failed (' + errStr(e) + '), retrying with defaults', 'warn'); stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false }); }
+    log(`Camera: got "${stream.getVideoTracks()[0]?.label || '?'}"`);
+    video.srcObject = stream;
+    const meta = new Promise(res => video.readyState >= 1 ? res() : video.addEventListener('loadedmetadata', res, { once: true }));
+    video.play().catch(e => log('video.play(): ' + errStr(e), 'warn'));
+    await meta;
+    log(`Camera: ${video.videoWidth}x${video.videoHeight}`);
+    camCv.height = Math.round(camCv.width * video.videoHeight / video.videoWidth);
+    status.textContent = 'Loading body tracking model…';
+  } catch (e) {
+    log('Camera failed: ' + errStr(e), 'error');
+    const hint = e.name === 'NotAllowedError' ? 'Permission denied: allow the camera in the address bar.'
+      : e.name === 'NotFoundError' ? 'No camera found.'
+      : e.name === 'NotReadableError' ? 'Camera is busy: close other apps using it.'
+      : e.message;
+    status.textContent = `Camera unavailable (${e.name}): ${hint} Keyboard still works.`; status.classList.add('err'); return;
+  }
+
+  let step = 'FilesetResolver';
+  try {
+    let t0 = performance.now();
+    const fileset = await FilesetResolver.forVisionTasks(WASM_BASE);
+    const opts = delegate => ({
+      baseOptions: { modelAssetPath: MODEL_URL, delegate },
+      runningMode: 'VIDEO', numPoses: 2,
+      minPoseDetectionConfidence: 0.5, minPosePresenceConfidence: 0.5, minTrackingConfidence: 0.5,
+    });
+    for (const delegate of ['GPU', 'CPU']) {
+      step = 'createFromOptions(' + delegate + ')';
+      t0 = performance.now();
+      try {
+        landmarker = await PoseLandmarker.createFromOptions(fileset, opts(delegate));
+        log(`Model: loaded with ${delegate} in ${Math.round(performance.now() - t0)} ms`);
+        break;
+      } catch (e) {
+        log(`Model: ${delegate} failed: ${errStr(e)}`, delegate === 'GPU' ? 'warn' : 'error');
+        if (delegate === 'CPU') throw e;
+      }
+    }
+    poseReady = true;
+    players.forEach(p => p.lastSeen = performance.now());
+    status.textContent = 'Tracking ready.';
+  } catch (e) {
+    log(`Model: gave up at ${step}: ${errStr(e)}`, 'error');
+    status.textContent = 'Could not start body tracking: see terminal log. Keyboard still works.'; status.classList.add('err');
+    // Diagnose: were the files even downloadable?
+    for (const [label, url] of [['WASM runtime', WASM_BASE + '/vision_wasm_internal.wasm'], ['Pose model', MODEL_URL]]) {
+      try { const r = await fetch(url, { cache: 'no-store' }); log(`${label}: HTTP ${r.status}`); }
+      catch (err) { log(`${label}: download failed (${errStr(err)})`, 'error'); }
+    }
+  }
+}
+
+// Split the detected people between the two boards by where they stand.
+function assign(list) {
+  const dets = list.map(lm => ({ lm, x: vx((lm[11].x + lm[12].x) / 2), size: Math.hypot(lm[11].x - lm[12].x, lm[11].y - lm[12].y) }));
+  const out = [null, null];
+  if (!dets.length) return out;
+  if (solo) { out[0] = dets.sort((a, b) => b.size - a.size)[0].lm; return out; }
+  if (dets.length >= 2) {
+    dets.sort((a, b) => a.x - b.x); out[0] = dets[0].lm; out[1] = dets[dets.length - 1].lm;
+  } else {
+    const d = dets[0];
+    const d0 = players[0].lastX == null ? Infinity : Math.abs(players[0].lastX - d.x);
+    const d1 = players[1].lastX == null ? Infinity : Math.abs(players[1].lastX - d.x);
+    out[d0 === Infinity && d1 === Infinity ? (d.x < 0.5 ? 0 : 1) : (d0 <= d1 ? 0 : 1)] = d.lm;
+  }
+  return out;
+}
+
+function pollPose(now) {
+  if (!landmarker || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  let res;
+  try { res = landmarker.detectForVideo(video, now); }
+  catch (e) { if (detectErrors++ < 5) log('detectForVideo failed: ' + errStr(e), 'error'); return; }
+  const list = res.landmarks || [];
+  if (firstDetect) { firstDetect = false; log(`Detection running (${list.length} people in first frame)`); }
+  const a = assign(list);
+  players.forEach((p, i) => processPlayer(p, a[i], now));
+  const n = a.filter(Boolean).length;
+  $('#camStatus').textContent = n ? `Tracking ${n} ${n === 1 ? 'person' : 'people'}.` : 'No one in view: step in front of the camera.';
+}
+
+function processPlayer(p, lm, now) {
+  p.lm = lm || null;
+  if (!lm) {
+    if (p.seen) { p.seen = false; log(`${p.name}: out of view`); }
+    resetGestures(p); return;
+  }
+  const W = video.videoWidth, H = video.videoHeight;
+  const P = i => ({ i, x: vx(lm[i].x) * W, y: lm[i].y * H, v: lm[i].visibility ?? 1 });
+  const nose = P(0), s1 = P(11), s2 = P(12), w1 = P(15), w2 = P(16);
+  const sw = Math.hypot(s1.x - s2.x, s1.y - s2.y);
+  if (sw < 8 || s1.v < 0.5 || s2.v < 0.5) { resetGestures(p); return; }
+  if (!p.seen) { p.seen = true; log(`${p.name}: in view`); }
+  p.lastSeen = now;
+  const cx = (s1.x + s2.x) / 2, shY = (s1.y + s2.y) / 2;
+  p.lastX = cx / W;
+  const headY = nose.v > 0.5 ? nose.y : shY - 0.8 * sw;
+  const hands = w1.v > 0.5 && w2.v > 0.5;
+  // Left/right hand as seen by the players (works whatever the body labels say).
+  const [hL, hR] = w1.x <= w2.x ? [w1, w2] : [w2, w1];
+  const S = p.S;
+
+  // Move: both hands shifted together to one side of the body.
+  const shift = hands ? ((hL.x + hR.x) / 2 - cx) / sw : 0;
+  const eR = updSw(S.moveR, hands && shift > C.moveOn && (hL.x - cx) / sw > C.moveCross, !hands || shift < C.moveOff);
+  const eL = updSw(S.moveL, hands && shift < -C.moveOn && (cx - hR.x) / sw > C.moveCross, !hands || shift > -C.moveOff);
+
+  // Rotate: tilt the "held block", one hand up and the other down.
+  // Right hand higher = right side up = counter-clockwise, like turning a wheel.
+  const tilt = hands ? (hL.y - hR.y) / sw : 0;
+  const eCcw = updSw(S.tiltCcw, hands && tilt > C.tiltOn, !hands || tilt < C.tiltOff);
+  const eCw = updSw(S.tiltCw, hands && tilt < -C.tiltOn, !hands || tilt > -C.tiltOff);
+  if (eCcw === 'rise') p.game.rotate(-1);
+  if (eCw === 'rise') p.game.rotate(1);
+
+  // Both hands above head: start / resume.
+  const upL = (headY - hL.y) / sw, upR = (headY - hR.y) / sw;
+  updSw(S.up, hands && upL > C.handUpOn && upR > C.handUpOn, !hands || upL < C.handUpOff || upR < C.handUpOff);
+
+  // Squat: shoulders below a "standing height" baseline that snaps up quickly and drifts down slowly.
+  if (p.standY == null) p.standY = shY;
+  const drop = (shY - p.standY) / sw;
+  const eSq = updSw(S.squat, drop > C.squatOn, drop < C.squatOff);
+  if (!S.squat.on) p.standY += (shY - p.standY) * (shY < p.standY ? 0.3 : 0.004);
+
+  if (verbose) {
+    const ev = [eL === 'rise' && 'move ◀', eR === 'rise' && 'move ▶', eCcw === 'rise' && 'rotate ↺', eCw === 'rise' && 'rotate ↻', eSq === 'rise' && 'squat'].filter(Boolean);
+    if (ev.length) log(`${p.name}: ${ev.join(', ')}  (shift ${shift.toFixed(2)}, tilt ${tilt.toFixed(2)}, squat ${drop.toFixed(2)})`);
+  }
+  p.dbg = { hands, hLi: hL.i, hRi: hR.i, shift, tilt, drop, upL, upR };
+}
+
+function applyPlayer(p, now) {
+  const g = p.game, S = p.S;
+  // Held shift -> move with auto-repeat
+  const want = S.moveL.on && !S.moveR.on ? -1 : S.moveR.on && !S.moveL.on ? 1 : 0;
+  const dir = g.playing ? want : 0;
+  if (dir !== p.moveDir) { p.moveDir = dir; if (dir) { g.move(dir); p.moveNext = now + C.das; } }
+  else if (dir && now >= p.moveNext) { g.move(dir); p.moveNext = now + C.arr; }
+
+  if (S.squat.on && g.playing && now >= p.softNext) { g.softDrop(); p.softNext = now + C.softDropMs; }
+
+  // Start / resume: hold both hands up
+  if (g.state !== 'playing' && !(solo && p.i === 1)) {
+    if (!S.up.on) { p.holdStart = null; p.needLower = false; setHold(p, 0); }
+    else if (!p.needLower) {
+      p.holdStart ??= now;
+      const v = (now - p.holdStart) / C.startHoldMs; setHold(p, v);
+      if (v >= 1) { p.holdStart = null; if (g.state === 'paused') g.resume(); else g.start(); }
+    }
+  }
+  if (g.state === 'playing' && poseReady && now - p.lastSeen > C.lostPauseMs) g.pause('Lost sight of you.');
+
+  const c = p.chips;
+  c.left.classList.toggle('on', want === -1);
+  c.right.classList.toggle('on', want === 1);
+  c.ccw.classList.toggle('on', S.tiltCcw.on);
+  c.cw.classList.toggle('on', S.tiltCw.on);
+  c.squat.classList.toggle('on', S.squat.on);
+  p.dbgEl.textContent = showDbg && p.dbg
+    ? `shift ${p.dbg.shift.toFixed(2)} (>${C.moveOn})\ntilt  ${p.dbg.tilt.toFixed(2)} (>${C.tiltOn})\nsquat ${p.dbg.drop.toFixed(2)} (>${C.squatOn})`
+    : '';
+}
+
+const BONES = [[11,12],[11,23],[12,24],[23,24],[23,25],[24,26],[25,27],[26,28],[11,13],[13,15],[12,14],[14,16]];
+function drawCam() {
+  const w = camCv.width, h = camCv.height, ctx = cctx;
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, w, h);
+  if (video.readyState >= 2) {
+    ctx.save();
+    if (!swapLR) { ctx.translate(w, 0); ctx.scale(-1, 1); }
+    ctx.drawImage(video, 0, 0, w, h); ctx.restore();
+    ctx.fillStyle = 'rgba(0,0,0,.4)'; ctx.fillRect(0, 0, w, h);
+  }
+  ctx.font = 'bold 18px system-ui'; ctx.textBaseline = 'top';
+  if (!solo) {
+    ctx.setLineDash([6, 6]); ctx.strokeStyle = 'rgba(255,255,255,.25)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(w / 2, 0); ctx.lineTo(w / 2, h); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = PCOLORS[0]; ctx.textAlign = 'left'; ctx.fillText('P1', 8, 6);
+    ctx.fillStyle = PCOLORS[1]; ctx.textAlign = 'right'; ctx.fillText('P2', w - 8, 6);
+  }
+  for (const p of players) if (p.lm) drawSkeleton(p, w, h);
+}
+function drawSkeleton(p, w, h) {
+  const lm = p.lm, ctx = cctx;
+  const X = i => vx(lm[i].x) * w, Y = i => lm[i].y * h, vis = i => (lm[i].visibility ?? 1) > 0.4;
+  ctx.lineCap = 'round'; ctx.strokeStyle = p.color; ctx.globalAlpha = 0.8;
+  for (const [a, b] of BONES) {
+    if (!vis(a) || !vis(b)) continue;
+    ctx.lineWidth = [13, 14, 15, 16].includes(b) ? 6 : 3;
+    ctx.beginPath(); ctx.moveTo(X(a), Y(a)); ctx.lineTo(X(b), Y(b)); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  // The "held block" between the hands: shows what the game sees.
+  const d = p.dbg;
+  if (d && d.hands) {
+    const ax = X(d.hLi), ay = Y(d.hLi), bx = X(d.hRi), by = Y(d.hRi);
+    const s = Math.max(16, Math.hypot(bx - ax, by - ay) * 0.45);
+    const S = p.S, col = S.moveL.on || S.moveR.on ? '#3cff9e' : S.tiltCcw.on || S.tiltCw.on ? '#ffd84d' : p.color;
+    ctx.save(); ctx.translate((ax + bx) / 2, (ay + by) / 2); ctx.rotate(Math.atan2(by - ay, bx - ax));
+    ctx.fillStyle = col; ctx.globalAlpha = 0.55; ctx.fillRect(-s / 2, -s / 2, s, s);
+    ctx.globalAlpha = 1; ctx.strokeStyle = col; ctx.lineWidth = 3; ctx.strokeRect(-s / 2, -s / 2, s, s);
+    ctx.restore();
+    ctx.strokeStyle = col; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+  }
+  for (const i of [15, 16]) if (vis(i)) { ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(X(i), Y(i), 8, 0, 7); ctx.fill(); }
+  if (!solo && vis(0)) {
+    ctx.fillStyle = p.color; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.fillText(p.name, X(0), Y(0) - 24); ctx.textBaseline = 'top';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard (for testing / backup). In 1-player mode both key sets drive P1.
+// ---------------------------------------------------------------------------
+const KEYS = {
+  a: [0, 'L'], d: [0, 'R'], w: [0, 'CW'], q: [0, 'CCW'], s: [0, 'SOFT'],
+  ArrowLeft: [1, 'L'], ArrowRight: [1, 'R'], ArrowUp: [1, 'CW'], ArrowDown: [1, 'SOFT'],
+};
+addEventListener('pointerdown', unlockAudio);
+addEventListener('keydown', e => {
+  unlockAudio();
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if (k.startsWith('Arrow') || k === ' ') e.preventDefault();
+  const active = solo ? [players[0]] : players;
+  if (k === 'f') { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {}); return; }
+  if (k === 'm') { swapLR = !swapLR; log('Sides ' + (swapLR ? 'swapped' : 'normal')); return; }
+  if (k === 'b') { showDbg = verbose = !showDbg; log('Gesture debug ' + (verbose ? 'on' : 'off')); return; }
+  if (k === '1' || k === '2') { setMode(k === '1'); return; }
+  if (k === 'p') {
+    const anyPlaying = active.some(p => p.game.state === 'playing');
+    active.forEach(p => anyPlaying ? p.game.pause() : p.game.resume()); return;
+  }
+  if (k === 'Enter') { active.forEach(p => p.game.state === 'paused' ? p.game.resume() : p.game.state !== 'playing' && p.game.start()); return; }
+  const m = KEYS[k];
+  if (!m) return;
+  const g = players[solo ? 0 : m[0]].game;
+  if (m[1] === 'L') g.move(-1); else if (m[1] === 'R') g.move(1);
+  else if (m[1] === 'CW') g.rotate(1); else if (m[1] === 'CCW') g.rotate(-1);
+  else g.softDrop();
+});
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(50, now - last); last = now;
+  pollPose(now);
+  for (const p of players) {
+    if (solo && p.i === 1) continue;
+    applyPlayer(p, now); p.game.update(dt); drawBoard(p);
+  }
+  drawCam();
+  requestAnimationFrame(frame);
+}
+addEventListener('resize', resize);
+setMode(solo);
+requestAnimationFrame(frame);
+initCamera();
+</script>
+</body>
+</html>
