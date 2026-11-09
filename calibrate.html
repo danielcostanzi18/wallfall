@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallfall Calibration</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { --bg: #07070d; --panel: #10111b; --line: #262842; --text: #f2f3ff; --muted: #8a8fb3;
+    --accent: #ffd84d; --on: #3cff9e; --warn: #ff5f7a; --p1: #ff5fa2; --p2: #5ce1e6; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; padding: 14px 20px; border-bottom: 2px solid var(--line); }
+  h1 { margin: 0; font-size: 22px; letter-spacing: .12em; font-weight: 900;
+    background: linear-gradient(90deg, #ff5fa2, #ffd84d, #5ce1e6); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  input, select, button { font: inherit; font-size: 16px; color: var(--text); background: var(--panel);
+    border: 2px solid var(--line); border-radius: 10px; padding: 8px 12px; }
+  button { cursor: pointer; font-weight: 700; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); color: #1a1500; border-color: var(--accent); }
+  #status { color: var(--muted); font-size: 14px; }
+  #status.err { color: var(--warn); }
+  main { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 20px; padding: 20px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  #cam { display: block; width: 100%; border-radius: 14px; background: #000; border: 2px solid var(--line); }
+  .cue { background: var(--panel); border: 2px solid var(--line); border-radius: 14px; padding: 18px; text-align: center; }
+  .cue.go { border-color: var(--on); }
+  .cue.warn { border-color: #ff5a5a; }
+  .cue.warn #cueSub { color: #ff8a8a; font-weight: 600; }
+  #cueText { font-size: 56px; font-weight: 900; letter-spacing: .04em; line-height: 1.1; }
+  #cueSub { font-size: 20px; color: var(--muted); margin-top: 8px; min-height: 26px; }
+  .bar { height: 10px; background: var(--line); border-radius: 99px; overflow: hidden; margin-top: 14px; }
+  #cueBar { height: 100%; width: 0; background: var(--on); }
+  .card { background: var(--panel); border: 2px solid var(--line); border-radius: 14px; padding: 14px 16px; margin-top: 16px; }
+  h2 { margin: 0 0 10px; font-size: 14px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: 15px; font-variant-numeric: tabular-nums; }
+  th, td { padding: 5px 8px; text-align: right; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 600; }
+  td.good { color: var(--on); } td.bad { color: var(--warn); }
+  .muted { color: var(--muted); font-size: 13px; }
+  #notes li { color: var(--accent); margin: 4px 0; font-size: 14px; }
+  #liveBig { font-size: 64px; font-weight: 900; text-align: center; min-height: 80px; color: var(--on); }
+  #liveCounts { text-align: center; color: var(--muted); }
+  #liveLog { font: 13px ui-monospace, monospace; color: var(--muted); max-height: 140px; overflow: auto; white-space: pre; }
+  video { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>WALLFALL · CALIBRATION</h1>
+  <input id="name" placeholder="Player name" maxlength="40" autocomplete="off">
+  <button id="rec" class="primary">● Record session (~2 min)</button>
+  <button id="live">▶ Live test</button>
+  <label class="muted">thresholds
+    <select id="thSel"><option value="personal">personal</option><option value="default">default</option></select></label>
+  <span id="status">Starting camera…</span>
+</header>
+<main>
+  <section>
+    <canvas id="cam" width="640" height="480"></canvas>
+    <p class="muted">The bars under the camera image show what the game measures: sideways shift, height difference between your
+      hands, and squat depth. The dashed area is HOME; the solid lines are where an action triggers.
+      Keys: M = swap left/right (camera behind you).</p>
+  </section>
+  <section>
+    <div class="cue" id="cueBox">
+      <div id="cueText">Hi!</div>
+      <div id="cueSub">Type your name, then press Record. Follow the big prompts.</div>
+      <div class="bar"><div id="cueBar"></div></div>
+    </div>
+    <div class="card"><h2>Thresholds</h2><table id="thTable"></table><div id="stats" class="muted"></div></div>
+    <div class="card"><h2>Replay of your recording</h2>
+      <table id="evalTable"><tr><td class="muted">Record a session to see how the default and your personal thresholds would have done.</td></tr></table>
+      <ul id="notes"></ul></div>
+    <div class="card"><h2>Live test</h2><div id="liveBig"></div><div id="liveCounts"></div><div id="liveLog"></div></div>
+  </section>
+</main>
+<video id="video" playsinline muted></video>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+import { DEFAULTS, KEEP, features, GestureMachine } from './gesture-core.js';
+import { GESTURES, fit, evaluate } from './calibration.js';
+
+const WASM_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
+const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+const REPS = 5;
+const $ = s => document.querySelector(s);
+const video = $('#video'), cam = $('#cam'), cctx = cam.getContext('2d');
+
+// ---------- logging to the serve.py terminal ----------
+function log(msg) {
+  console.log('[calibrate] ' + msg);
+  fetch('/log', { method: 'POST', body: 'calibrate: ' + msg }).catch(() => {});
+}
+function status(msg, err = false) { const el = $('#status'); el.textContent = msg; el.classList.toggle('err', err); }
+
+// ---------- sound cues ----------
+let actx = null;
+function unlockAudio() { try { actx ??= new AudioContext(); if (actx.state === 'suspended') actx.resume(); } catch (e) {} }
+function beep(f, d = 0.12, vol = 0.15) {
+  if (!actx || actx.state !== 'running') return;
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = 'square'; o.frequency.value = f;
+  g.gain.setValueAtTime(vol, actx.currentTime); g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + d);
+  o.connect(g).connect(actx.destination); o.start(); o.stop(actx.currentTime + d);
+}
+addEventListener('pointerdown', unlockAudio);
+addEventListener('keydown', unlockAudio);
+
+// ---------- profile ----------
+const slugOf = n => (n || '').toLowerCase().normalize('NFKD').replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+let personal = null;          // thresholds from the profile / last calibration
+let lastFit = null, lastEval = null;
+async function loadProfile() {
+  const slug = slugOf($('#name').value);
+  if (!slug) return;
+  try {
+    const r = await fetch(`profiles/${slug}.json`, { cache: 'no-store' });
+    if (!r.ok) { personal = null; status(`New player "${slug}": record a session to calibrate.`); renderThresholds(); return; }
+    const prof = await r.json();
+    personal = prof.thresholds; lastFit = { th: prof.thresholds, stats: prof.stats || {}, notes: prof.notes || [] };
+    status(`Loaded profile "${slug}" (calibrated ${new Date(prof.created).toLocaleString()}).`);
+    renderThresholds(); restartLive();
+    log(`loaded profile ${slug}`);
+  } catch (e) { status('Could not load profile: ' + e.message, true); }
+}
+$('#name').addEventListener('change', loadProfile);
+$('#thSel').addEventListener('change', restartLive);
+
+async function save(path, obj) {
+  const r = await fetch('/save/' + path, { method: 'POST', body: JSON.stringify(obj) });
+  if (!r.ok) throw new Error(`HTTP ${r.status} (restart serve.py so it has the save feature)`);
+}
+
+// ---------- tables ----------
+const TH_ROWS = [
+  ['homeShift', 'Home: max sideways offset'], ['homeLevel', 'Home: max height difference'],
+  ['stepOn', 'Move: sideways swing needed'], ['liftOn', 'Rotate: height difference needed'],
+  ['reverseMargin', 'Extra for the opposite action'], ['squatOn', 'Squat: shoulder drop needed'], ['squatOff', 'Squat: released below'],
+];
+function renderThresholds() {
+  const th = personal;
+  $('#thTable').innerHTML = `<tr><th></th><th>default</th><th>yours</th></tr>` + TH_ROWS.map(([k, label]) =>
+    `<tr><td>${label}</td><td>${DEFAULTS[k]}</td><td>${th ? th[k] : '–'}</td></tr>`).join('');
+  const s = lastFit && lastFit.stats;
+  $('#stats').innerHTML = s && s.swingMedian != null ? `Measured (shoulder widths): home jitter ±${s.homeShiftP95} sideways / ±${s.homeLevelP95} height ·
+    swings ${s.swingMedian} (min ${s.swingMin}) · lifts ${s.liftMedian} (min ${s.liftMin}) · squat ${s.squatMedian} (min ${s.squatMin}) ·
+    height change while swinging ${s.liftDuringSwings} · sideways while lifting ${s.swingDuringLifts}` : '';
+}
+const NAMES = { left: 'Move ◀', right: 'Move ▶', cw: 'Rotate ↻', ccw: 'Rotate ↺', squat: 'Squat' };
+function renderEval(a, b) {
+  const cell = (r) => {
+    const cls = r.correct === r.reps && !r.extra ? 'good' : r.correct < r.reps * 0.8 || r.extra ? 'bad' : '';
+    return `<td class="${cls}">${r.correct}/${r.reps}</td><td>${r.missed}</td><td>${r.wrong}</td><td>${r.extra}</td>`;
+  };
+  $('#evalTable').innerHTML =
+    `<tr><th></th><th colspan="4">default</th><th colspan="4">yours</th></tr>
+     <tr><th>gesture</th><th>ok</th><th>miss</th><th>wrong</th><th>extra</th><th>ok</th><th>miss</th><th>wrong</th><th>extra</th></tr>` +
+    GESTURES.map(g => `<tr><td>${NAMES[g]}</td>${cell(a.res[g])}${cell(b.res[g])}</tr>`).join('') +
+    `<tr><td>Actions before the first prompt</td><td colspan="4">${a.spurious}</td><td colspan="4">${b.spurious}</td></tr>
+     <tr><th>Total correct</th><th colspan="4">${a.total.correct}/${a.total.reps} (+${a.total.extra} extra)</th>
+         <th colspan="4">${b.total.correct}/${b.total.reps} (+${b.total.extra} extra)</th></tr>`;
+}
+
+// ---------- camera + pose ----------
+let landmarker = null, lastVideoTime = -1, mirror = true, lm = null, feat = { ok: false };
+async function init() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } }, audio: false });
+    video.srcObject = stream;
+    await new Promise(res => video.readyState >= 1 ? res() : video.addEventListener('loadedmetadata', res, { once: true }));
+    video.play().catch(() => {});
+    cam.height = Math.round(cam.width * video.videoHeight / video.videoWidth);
+    status('Loading body tracking…');
+    const fileset = await FilesetResolver.forVisionTasks(WASM_BASE);
+    for (const delegate of ['GPU', 'CPU']) {
+      try {
+        landmarker = await PoseLandmarker.createFromOptions(fileset, { baseOptions: { modelAssetPath: MODEL_URL, delegate }, runningMode: 'VIDEO', numPoses: 1 });
+        log(`tracking ready (${delegate})`); break;
+      } catch (e) { if (delegate === 'CPU') throw e; }
+    }
+    status('Ready. Type your name and press Record.');
+  } catch (e) { status('Camera / tracking failed: ' + e.message, true); log('init failed: ' + e.message); }
+}
+
+// ---------- recording ----------
+const CUES = {
+  left: ['MOVE ◀', 'Swing both hands to YOUR left, then back home'],
+  right: ['MOVE ▶', 'Swing both hands to YOUR right, then back home'],
+  cw: ['ROTATE ↻', 'Left hand higher: lift your left hand (or drop your right)'],
+  ccw: ['ROTATE ↺', 'Right hand higher: lift your right hand (or drop your left)'],
+  squat: ['SQUAT', 'Squat down, then stand back up'],
+};
+function buildPlan() {
+  const p = [{ label: 'ready', text: 'Get ready…', sub: 'Walk to where you will play, face the camera', ms: 5000 },
+             { label: 'home', text: 'HOME', sub: 'Both hands up in front of you, level. Hold still.', ms: 4000 }];
+  for (const g of GESTURES) for (let r = 1; r <= REPS; r++) {
+    p.push({ label: g, rep: r, text: CUES[g][0], sub: `${CUES[g][1]} · ${r}/${REPS}`, ms: g === 'squat' ? 2600 : 2000, go: true });
+    p.push({ label: 'return', text: 'HOME', sub: 'back home: hands up, level, still', ms: 1500 });
+  }
+  return p;
+}
+let rec = null;
+$('#rec').addEventListener('click', () => {
+  const slug = slugOf($('#name').value);
+  if (!slug) { status('Type a player name first.', true); $('#name').focus(); return; }
+  if (!landmarker) { status('Body tracking is not ready yet.', true); return; }
+  unlockAudio(); stopLive();
+  rec = { slug, name: $('#name').value.trim(), plan: buildPlan(), idx: -1, t0: performance.now(), cueStart: 0, cues: [], frames: [] };
+  $('#rec').disabled = $('#live').disabled = true;
+  log(`recording session for ${slug}`);
+});
+function recTick(now) {
+  const t = now - rec.t0, cur = rec.plan[rec.idx];
+  if (rec.idx === -1 || t >= rec.cueStart + cur.ms) {
+    if (cur) rec.cues.push({ label: cur.label, rep: cur.rep ?? null, t0: Math.round(rec.cueStart), t1: Math.round(t) });
+    rec.idx++; rec.cueStart = t;
+    const nx = rec.plan[rec.idx];
+    if (!nx) { finishRecording(); return; }
+    $('#cueText').textContent = nx.text; $('#cueSub').textContent = nx.sub;
+    $('#cueBox').classList.toggle('go', !!nx.go);
+    if (nx.go) beep(880); else if (nx.label === 'home' || nx.label === 'return') beep(440, 0.08, 0.08);
+  }
+  const c = rec.plan[rec.idx];
+  if (c && (c.label === 'home' || c.label === 'return')) {   // warn live: HOME means hands UP in front, not resting at your sides
+    const down = feat.ok && feat.hands && feat.lowHand >= DEFAULTS.holdMaxDrop;
+    $('#cueSub').textContent = down ? '⚠ Hands UP in front of your chest — not down by your sides!' : c.sub;
+    $('#cueBox').classList.toggle('warn', down);
+  } else $('#cueBox').classList.remove('warn');
+  if (c) {
+    $('#cueBar').style.width = Math.min(100, (t - rec.cueStart) / c.ms * 100) + '%';
+    if (c.label === 'ready') $('#cueText').textContent = `Get ready… ${Math.ceil((c.ms - (t - rec.cueStart)) / 1000)}`;
+  }
+}
+const r4 = v => Math.round(v * 1e4) / 1e4, r2 = v => Math.round(v * 100) / 100;
+function recordFrame(now) {
+  rec.frames.push({ t: Math.round(now - rec.t0), p: lm ? KEEP.map(i => [r4(lm[i].x), r4(lm[i].y), r2(lm[i].visibility ?? 1)]) : null });
+}
+async function finishRecording() {
+  const r = rec; rec = null;
+  $('#cueText').textContent = 'Done!'; $('#cueSub').textContent = 'Analysing…'; $('#cueBox').classList.remove('go'); $('#cueBar').style.width = '100%';
+  $('#rec').disabled = $('#live').disabled = false;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const session = { version: 1, name: r.name, slug: r.slug, created: new Date().toISOString(), W: video.videoWidth, H: video.videoHeight,
+    mirror, keep: KEEP, reps: REPS, cues: r.cues, frames: r.frames, userAgent: navigator.userAgent };
+  const sessionPath = `recordings/${r.slug}/session-${stamp}.json`;
+  try { await save(sessionPath, session); } catch (e) { status('Saving the recording failed: ' + e.message, true); }
+  const seen = r.frames.filter(f => f.p).length;
+  log(`recorded ${r.frames.length} frames (${seen} with a person) -> ${sessionPath}`);
+  const f = fit(session);
+  if (f.error) { $('#cueSub').textContent = f.error; status(f.error, true); log('fit failed: ' + f.error); return; }
+  lastFit = f; personal = f.th;
+  const a = evaluate(session, DEFAULTS), b = evaluate(session, f.th);
+  lastEval = { a, b };
+  renderThresholds(); renderEval(a, b);
+  $('#notes').innerHTML = f.notes.map(n => `<li>${n}</li>`).join('');
+  $('#cueSub').textContent = `Default: ${a.total.correct}/${a.total.reps} correct · Yours: ${b.total.correct}/${b.total.reps} correct. Try them in Live test.`;
+  const profile = { name: r.name, slug: r.slug, created: session.created, thresholds: f.th, stats: f.stats, peaks: f.peaks, notes: f.notes,
+    session: sessionPath, score: { default: a.total, personal: b.total } };
+  try { await save(`profiles/${r.slug}.json`, profile); status(`Saved profile "${r.slug}".`); } catch (e) { status('Saving the profile failed: ' + e.message, true); }
+  log(`fit ${r.slug}: ${JSON.stringify(f.th)}`);
+  log(`replay default ${a.total.correct}/${a.total.reps} (+${a.total.extra} extra), personal ${b.total.correct}/${b.total.reps} (+${b.total.extra} extra)`);
+  $('#thSel').value = 'personal'; startLive();
+}
+
+// ---------- live test ----------
+let live = null;
+function currentTh() { return $('#thSel').value === 'personal' && personal ? personal : DEFAULTS; }
+function startLive() {
+  live = { m: new GestureMachine(currentTh()), counts: {}, prevSq: false, log: [] };
+  $('#live').textContent = '■ Stop live test';
+  $('#liveBig').textContent = ''; $('#liveCounts').textContent = `using ${currentTh() === DEFAULTS ? 'default' : 'your'} thresholds`; $('#liveLog').textContent = '';
+}
+function stopLive() { live = null; $('#live').textContent = '▶ Live test'; }
+function restartLive() { if (live) startLive(); renderThresholds(); }
+$('#live').addEventListener('click', () => { unlockAudio(); live ? stopLive() : startLive(); });
+function liveTick(now) {
+  const r = live.m.update(feat, now);
+  let ev = r.action;
+  if (r.squat && !live.prevSq) ev = 'squat';
+  live.prevSq = r.squat;
+  if (ev) {
+    live.counts[ev] = (live.counts[ev] || 0) + 1;
+    $('#liveBig').textContent = NAMES[ev];
+    live.log.unshift(`${(now / 1000).toFixed(1)}s  ${NAMES[ev]}`); live.log.length = Math.min(live.log.length, 30);
+    $('#liveLog').textContent = live.log.join('\n');
+    $('#liveCounts').textContent = GESTURES.map(g => `${NAMES[g]} ${live.counts[g] || 0}`).join(' · ');
+    beep(ev === 'squat' ? 330 : 660, 0.06, 0.08);
+  }
+  live.state = r.state; live.drop = r.drop;
+}
+
+// ---------- drawing ----------
+const BONES = [[11,12],[11,23],[12,24],[23,24],[11,13],[13,15],[12,14],[14,16],[23,25],[24,26]];
+function meter(y, label, v, home, on, range, extra = '') {
+  const w = cam.width, x0 = 120, x1 = w - 20, mid = (x0 + x1) / 2, u = (x1 - x0) / 2 / range, ctx = cctx;
+  ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(0, y - 14, w, 28);
+  ctx.fillStyle = '#c9cce6'; ctx.font = '13px system-ui'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.fillText(label, 8, y);
+  ctx.fillStyle = 'rgba(255,255,255,.15)'; ctx.fillRect(x0, y - 2, x1 - x0, 4);
+  if (home != null) { ctx.setLineDash([4, 3]); ctx.strokeStyle = 'rgba(255,255,255,.6)'; ctx.strokeRect(mid - home * u, y - 9, 2 * home * u, 18); ctx.setLineDash([]); }
+  ctx.fillStyle = '#3cff9e';
+  for (const s of (home != null ? [-1, 1] : [1])) ctx.fillRect((home != null ? mid : x0) + s * on * u - 1.5, y - 11, 3, 22);
+  const vx = Math.max(x0, Math.min(x1, (home != null ? mid : x0) + v * u));
+  ctx.fillStyle = '#ffd84d'; ctx.beginPath(); ctx.arc(vx, y, 6, 0, 7); ctx.fill();
+  ctx.fillStyle = '#c9cce6'; ctx.textAlign = 'right'; ctx.fillText(v.toFixed(2) + extra, x0 - 8, y);
+}
+function draw() {
+  const w = cam.width, h = cam.height, ctx = cctx;
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, w, h);
+  if (video.readyState >= 2) {
+    ctx.save(); if (mirror) { ctx.translate(w, 0); ctx.scale(-1, 1); } ctx.drawImage(video, 0, 0, w, h); ctx.restore();
+    ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(0, 0, w, h);
+  }
+  if (lm) {
+    const X = i => (mirror ? 1 - lm[i].x : lm[i].x) * w, Y = i => lm[i].y * h, vis = i => (lm[i].visibility ?? 1) > 0.4;
+    ctx.strokeStyle = '#ff5fa2'; ctx.lineWidth = 4; ctx.lineCap = 'round';
+    for (const [a, b] of BONES) if (vis(a) && vis(b)) { ctx.beginPath(); ctx.moveTo(X(a), Y(a)); ctx.lineTo(X(b), Y(b)); ctx.stroke(); }
+    for (const i of [15, 16]) if (vis(i)) { ctx.fillStyle = '#ffd84d'; ctx.beginPath(); ctx.arc(X(i), Y(i), 8, 0, 7); ctx.fill(); }
+  }
+  const th = currentTh();
+  if (feat.ok) {
+    meter(h - 78, 'sideways', feat.shift, th.homeShift, th.stepOn, 1.6);
+    meter(h - 48, 'height diff', feat.lift, th.homeLevel, th.liftOn, 1.6);
+    meter(h - 18, 'squat', live ? live.drop || 0 : 0, null, th.squatOn, 1.5, live ? '' : ' (live)');
+  }
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 15px system-ui'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillText(rec ? '● REC' : live ? `LIVE · ${live.state || ''}` : (lm ? 'tracking' : 'no one in view'), 10, 10);
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    try {
+      const res = landmarker.detectForVideo(video, now);
+      lm = res.landmarks && res.landmarks[0] || null;
+      feat = features(lm, video.videoWidth, video.videoHeight, mirror);
+      if (rec) recordFrame(now);
+      else if (live) liveTick(now);
+    } catch (e) { /* skip a bad frame */ }
+  }
+  if (rec) recTick(now);
+  draw();
+}
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  if (e.key === 'm' || e.key === 'M') { mirror = !mirror; status('Left/right ' + (mirror ? 'normal' : 'swapped')); }
+});
+renderThresholds();
+requestAnimationFrame(frame);
+init();
+</script>
+</body>
+</html>

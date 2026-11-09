@@ -6,12 +6,17 @@ A webcam watches the players and turns big gestures into moves. Up to two people
 ## Run
 
 ```
-python3 serve.py          # then open http://localhost:8000 in Chrome
+./start.sh                # starts the server and opens the game in its own Chrome window
 ```
 
-Use `localhost`, not `0.0.0.0` or an IP address, or the browser blocks the camera.
-`serve.py` also prints the game's log in the terminal. The body-tracking model
-(MediaPipe Pose) loads from a CDN, so you need internet on first load.
+The launcher's Chrome window may play sound straight away (normally browsers wait for a click or
+key press, which never happens when you only use gestures). It uses its own Chrome profile, so your
+normal browser isn't affected; the camera permission is asked once and remembered.
+
+Without the launcher: `python3 serve.py`, open http://localhost:8000 in Chrome, and press any key
+once for sound. Use `localhost`, not `0.0.0.0` or an IP address, or the browser blocks the camera.
+`serve.py` prints the game's log in the terminal. The body-tracking model (MediaPipe Pose) loads
+from a CDN, so you need internet on first load.
 
 ## Gestures
 
@@ -27,6 +32,9 @@ it does exactly one thing, and nothing else counts until your hands are back in 
 | Squat | Drop faster (nothing else counts while squatting) |
 | Both hands above your head (hold) | Start / resume |
 
+The blocks fall faster and faster the longer you play (pauses don't count): after about
+4 minutes they fall almost as fast as a squat drop. Tune `startGravity`, `endGravity` and `rampMs` in `C`.
+
 The controls are a small state machine per player: `NO_HANDS → RETURN → READY → one action → RETURN`,
 with `SQUAT` from any state. Two kinds of hysteresis keep it to one action per gesture:
 - **Area**: the home area is smaller than the action thresholds; the band in between does nothing.
@@ -41,10 +49,35 @@ The game switches between 1 and 2 players by itself, from how many people the ca
 (press 0 for auto, 1 or 2 to lock it). In 2-player mode, whoever stands on the left plays the left board. Both players get the same
 sequence of blocks.
 
+## Calibration (testing)
+
+`./start.sh 8000 calibrate.html` (or http://localhost:8000/calibrate.html) opens the calibration page:
+
+1. Type a player name and press **Record session**. Follow the big prompts (~2 min): hold HOME, then
+   5 × each gesture (move left/right, rotate ↻/↺, squat), returning home after each.
+2. The page measures your movements and fits **personal thresholds**, then replays your recording
+   with the default and your thresholds and shows hits / misses / wrong / extra for each gesture.
+3. **Live test** shows every detected action as you move, with default or your thresholds.
+
+Recordings go to `recordings/<name>/` (raw pose data, for analysis) and thresholds to
+`profiles/<name>.json`; both are git-ignored. The game itself doesn't use the profiles yet.
+The gesture logic shared by the page lives in `gesture-core.js` (same rules as the game),
+fitting/scoring in `calibration.js`.
+
+## Music
+
+Wallfall's own 8-bit arrangement of *Korobeiniki* (19th-century Russian folk song, public domain):
+the folk tune's main theme over an original bass line, plus an original bridge. It's synthesised live
+in the browser, plays while someone is playing and speeds up with the fall speed. Browsers only allow sound
+after a click or key press, so press any key once (F for fullscreen works). N turns the music on/off;
++ and − change its volume.
+
+A rendered copy (two loops) is in [`music/wallfall-korobeiniki-8bit.mp3`](music/wallfall-korobeiniki-8bit.mp3).
+
 ## Keys
 
 P1: A/D move, W/Q rotate, S drop. P2: ←/→ move, ↑ rotate, ↓ drop.
-Enter start · P pause · 0/1/2 players · F fullscreen · M swap sides (camera behind players) · B gesture debug.
+Enter start · P pause · 0/1/2 players · F fullscreen · M swap sides (camera behind players) · N music on/off · +/− music volume · B gesture debug.
 
 ## Setup tips
 

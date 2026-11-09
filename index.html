@@ -55,6 +55,8 @@
   #cam { display: block; width: 100%; border-radius: 12px; background: #000; border: 2px solid var(--line); }
   #camStatus { font-size: 1.8vh; color: var(--muted); min-height: 2.2vh; text-align: center; }
   #camStatus.err { color: var(--warn); }
+  #soundHint { font-size: 1.7vh; color: var(--accent); text-align: center; }
+  #soundHint.hidden { display: none; }
   .howto { font-size: 1.75vh; line-height: 1.5; }
   .howto b { color: var(--accent); }
   .best { display: flex; justify-content: space-between; align-items: baseline; }
@@ -69,10 +71,11 @@
     <canvas id="cam" width="480" height="270"></canvas>
     <div id="camStatus">Starting camera…</div>
     <div class="label" id="modeLabel" style="text-align:center"></div>
+    <div id="soundHint">🔇 Press any key or click once to turn on sound</div>
     <div class="card howto" id="howto"></div>
     <div class="card best"><span class="label">Best</span><span class="value small" id="best">0</span></div>
     <div class="keys">Keys: P1 A/D move · W/Q rotate · S drop — P2 ←→ move · ↑ rotate · ↓ drop<br>
-      Enter start · P pause · 0/1/2 players · F fullscreen · M swap sides · B gesture debug</div>
+      Enter start · P pause · 0/1/2 players · F fullscreen · M swap sides · N music · +/− volume · B gesture debug</div>
   </div>
 </div>
 <video id="video" playsinline muted></video>
@@ -112,7 +115,11 @@ const C = {
   autoDuoMs: 2000,      // auto players: two people in view this long -> 2-player mode
   autoSoloMs: 3000,     // only one person in view this long -> 1-player mode...
   autoSoloBusyMs: 12000,// ...but wait this long if the missing player was mid-game
-  startGravity: 1000, minGravity: 90, gravityFactor: 0.85, // ms per row
+  musicVolume: 1.0, // music loudness, 0..2 (+ / - keys while playing)
+  maxFps: 30,       // redraw at most this often (the camera is 30 fps anyway; higher just heats the laptop)
+  // Fall speed ramps up with play time (pauses don't count): startGravity ms per row at the start,
+  // endGravity after rampMs (4 min; almost the squat speed, softDropMs), then stays there.
+  startGravity: 1000, endGravity: 75, rampMs: 240000,
   lockDelay: 500, maxLockResets: 15, clearMs: 260,
 };
 
@@ -172,7 +179,10 @@ addEventListener('unhandledrejection', e => log('Unhandled promise: ' + errStr(e
 let actx = null;
 function unlockAudio() {
   try {
-    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    if (!actx) {
+      actx = new (window.AudioContext || window.webkitAudioContext)();
+      actx.addEventListener('statechange', () => log(`Sound: ${actx.state}`));
+    }
     if (actx.state === 'suspended') actx.resume();
   } catch (e) {}
 }
@@ -184,6 +194,70 @@ function beep(f, d = 0.06, type = 'square', vol = 0.04) {
   g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + d);
   o.connect(g).connect(actx.destination);
   o.start(); o.stop(actx.currentTime + d);
+}
+
+// ---------------------------------------------------------------------------
+// Music: Wallfall's own 8-bit arrangement of "Korobeiniki" (19th-century Russian folk song,
+// public domain). Melody = the folk tune's main theme (A minor), played twice; the bass line and
+// the bridge are original to Wallfall. Square-wave lead over a triangle bass; speeds up with the
+// fall speed; plays only while someone is playing. Format: NOTE[:eighths], "-" = rest, "|" = bar line.
+// ---------------------------------------------------------------------------
+const MELODY = `
+  E5:2 B4 C5 D5:2 C5 B4 | A4:2 A4 C5 E5:2 D5 C5 | B4:3 C5 D5:2 E5:2 | C5:2 A4:2 A4:4 |
+  D5:3 F5 A5:2 G5 F5 | E5:3 C5 E5:2 D5 C5 | B4:2 B4 C5 D5:2 E5:2 | C5:2 A4:2 A4:4 |
+  E5:2 B4 C5 D5:2 C5 B4 | A4:2 A4 C5 E5:2 D5 C5 | B4:3 C5 D5:2 E5:2 | C5:2 A4:2 A4:4 |
+  D5:3 F5 A5:2 G5 F5 | E5:3 C5 E5:2 D5 C5 | B4:2 B4 C5 D5:2 E5:2 | C5:2 A4:2 A4:2 -:2 |
+  C5:2 E5:2 G5:2 E5:2 | F5:2 A5:2 G5:4 | E5:2 G5:2 C6:2 B5:2 | A5:4 G#5:4 |
+  A5 E5 C5 E5 A5 E5 C5 E5 | G5 D5 B4 D5 G5 D5 B4 D5 | F5:2 E5:2 D5:2 B4:2 | A4:4 E4:4 |`;
+// one root per bar (the bass alternates root and fifth in quarter notes)
+const BASS = 'A2 A2 E2 A2 D2 C3 E2 A2  A2 A2 E2 A2 D2 C3 E2 A2  C3 F2 C3 E2 A2 G2 D2 A2'.split(/\s+/).join(' ');
+const midiOf = n => { const t = /^([A-G])(#?)(\d)$/.exec(n); return 12 * (+t[3] + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[t[1]] + (t[2] ? 1 : 0); };
+const LOOP = BASS.split(' ').length * 8, SONG = Array.from({ length: LOOP }, () => []);   // SONG[eighth] = notes starting there
+{
+  let pos = 0;
+  for (const tok of MELODY.replace(/\|/g, ' ').trim().split(/\s+/)) {
+    const [n, d = '1'] = tok.split(':');
+    if (n !== '-') SONG[pos].push(['lead', midiOf(n), +d]);
+    pos += +d;
+  }
+  if (pos !== LOOP) console.warn('[wallfall] melody length', pos);
+  BASS.split(' ').forEach((n, bar) => { for (let q = 0; q < 4; q++) SONG[bar * 8 + q * 2].push(['bass', midiOf(n) + 12 + (q % 2 ? 7 : 0), 2]); });
+}
+const music = { on: true, playing: false, step: 0, next: 0, gain: null };
+// Music bus: volume -> compressor -> speakers. The compressor lets it be loud without clipping.
+function musicBus(ctx) {
+  const gain = ctx.createGain(), comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -14; comp.knee.value = 6; comp.ratio.value = 4; comp.attack.value = 0.003; comp.release.value = 0.15;
+  gain.connect(comp).connect(ctx.destination);
+  return gain;
+}
+// One note: quick attack, held (gently decaying) for its whole length, short release.
+function musicNote(ctx, dest, midi, t, dur, voice) {
+  const o = ctx.createOscillator(), g = ctx.createGain(), lead = voice === 'lead';
+  o.type = lead ? 'square' : 'triangle';
+  o.frequency.value = 440 * Math.pow(2, (midi - 69) / 12);
+  const vol = lead ? 0.2 : 0.32;
+  const rel = Math.min(0.04, dur * 0.3);
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(vol, t + 0.006);
+  g.gain.linearRampToValueAtTime(vol * 0.75, t + dur - rel);
+  g.gain.linearRampToValueAtTime(0, t + dur);
+  o.connect(g).connect(dest);
+  o.start(t); o.stop(t + dur + 0.01);
+}
+function musicTick() {
+  if (!actx || actx.state !== 'running') return;
+  if (!music.gain) music.gain = musicBus(actx);
+  music.gain.gain.value = C.musicVolume;
+  const active = players.filter(p => p.game.state === 'playing');
+  if (!music.on || !active.length) { music.playing = false; return; }
+  if (!music.playing) { music.playing = true; music.next = actx.currentTime + 0.06; log(`Music playing (volume ${Math.round(C.musicVolume * 100)}%)`); }   // (re)start where we left off
+  const speedT = Math.max(...active.map(p => p.game.speedT()));
+  const eighth = 60 / (140 + 50 * speedT) / 2;                     // 140 BPM, speeding up with the fall speed to 190
+  while (music.next < actx.currentTime + 0.15) {
+    for (const [voice, midi, d] of SONG[music.step]) musicNote(actx, music.gain, midi, music.next, d * eighth * 0.92, voice);
+    music.next += eighth; music.step = (music.step + 1) % LOOP;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +291,7 @@ class Game {
   reset() {
     this.board = newBoard(); this.seqIdx = 0; this.piece = null; this.next = null;
     this.score = 0; this.lines = 0; this.level = 1; this.clearing = null; this.popup = null;
-    this.dropAcc = 0; this.lockAcc = 0; this.lockResets = 0;
+    this.dropAcc = 0; this.lockAcc = 0; this.lockResets = 0; this.playMs = 0;
   }
   nextType() { return seqAt(this.seqIdx++); }
   get playing() { return this.state === 'playing' && !!this.piece && !this.clearing; }
@@ -230,13 +304,15 @@ class Game {
     }
     return false;
   }
-  gravityMs() { return Math.max(C.minGravity, C.startGravity * Math.pow(C.gravityFactor, this.level - 1)); }
+  speedT() { return Math.min(1, this.playMs / C.rampMs); }   // 0 at the start .. 1 at full speed
+  gravityMs() { return C.startGravity * Math.pow(C.endGravity / C.startGravity, this.speedT()); }  // same % faster every second
   start() {
     const others = players.filter(q => q.game !== this && ['playing', 'paused'].includes(q.game.state));
     if (!others.length) { seq = []; seqBag = []; }
     this.reset(); this.next = this.nextType(); this.state = 'playing'; resetRef(this.p, 'new game');
     hideOverlay(this.p); this.spawn(); updateHUD(this.p);
     beep(660, .12, 'triangle', .06);
+    if (!actx || actx.state !== 'running') log('Sound is OFF: press any key or click the page once to turn it on', 'warn');
     log(`${this.p.name}: game started (${others.length ? 'same pieces as ' + others.map(q => q.name).join(', ') : 'new piece order'})`);
   }
   spawn() {
@@ -296,6 +372,9 @@ class Game {
   update(dt) {
     if (this.popup && (this.popup.t += dt) > 900) this.popup = null;
     if (this.state !== 'playing') return;
+    const min = Math.floor(this.playMs / 60000);
+    this.playMs += dt;
+    if (Math.floor(this.playMs / 60000) > min) log(`${this.p.name}: ${min + 1} min played, ${Math.round(this.gravityMs())} ms per row`);
     if (this.clearing) {
       this.clearing.t += dt;
       if (this.clearing.t >= C.clearMs) {
@@ -501,17 +580,32 @@ function shade(hex, amt) {
   return `rgb(${r},${g},${b})`;
 }
 function drawBlock(ctx, x, y, s, color, ghost = false) {
-  const p = Math.max(1, s * 0.06), r = s * 0.2;
-  ctx.beginPath(); ctx.roundRect(x + p, y + p, s - 2 * p, s - 2 * p, r);
   if (ghost) {
+    const p = Math.max(1, s * 0.06), r = s * 0.2;
+    ctx.beginPath(); ctx.roundRect(x + p, y + p, s - 2 * p, s - 2 * p, r);
     ctx.globalAlpha = 0.5; ctx.strokeStyle = color; ctx.lineWidth = Math.max(2, s * 0.08); ctx.stroke();
     ctx.globalAlpha = 1; return;
   }
-  const g = ctx.createLinearGradient(x, y, x, y + s);
+  ctx.drawImage(blockSprite(color, s), x, y, s, s);
+}
+// Each block colour/size is drawn once into a small canvas and then just copied: much cheaper
+// than building a gradient for every block on every frame.
+const spriteCache = new Map();
+function blockSprite(color, s) {
+  const dpr = window.devicePixelRatio || 1, key = color + '|' + s + '|' + dpr;
+  let cv = spriteCache.get(key);
+  if (cv) return cv;
+  cv = document.createElement('canvas'); cv.width = cv.height = Math.ceil(s * dpr);
+  const c = cv.getContext('2d'); c.scale(dpr, dpr);
+  const p = Math.max(1, s * 0.06), r = s * 0.2;
+  const g = c.createLinearGradient(0, 0, 0, s);
   g.addColorStop(0, shade(color, 0.3)); g.addColorStop(1, shade(color, -0.25));
-  ctx.fillStyle = g; ctx.fill();
-  ctx.fillStyle = 'rgba(255,255,255,.28)';
-  ctx.beginPath(); ctx.roundRect(x + s * 0.22, y + s * 0.15, s * 0.56, s * 0.13, s * 0.065); ctx.fill();
+  c.fillStyle = g; c.beginPath(); c.roundRect(p, p, s - 2 * p, s - 2 * p, r); c.fill();
+  c.fillStyle = 'rgba(255,255,255,.28)';
+  c.beginPath(); c.roundRect(s * 0.22, s * 0.15, s * 0.56, s * 0.13, s * 0.065); c.fill();
+  if (spriteCache.size > 200) spriteCache.clear();
+  spriteCache.set(key, cv);
+  return cv;
 }
 function eachCell(m, fn) {
   for (let r = 0; r < m.length; r++) for (let c = 0; c < m.length; c++) if (m[r][c]) fn(c, r);
@@ -630,7 +724,7 @@ async function initCamera() {
   }
   try {
     let stream;
-    try { stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' }, audio: false }); }
+    try { stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 }, facingMode: 'user' }, audio: false }); }
     catch (e) { log('Camera: preferred settings failed (' + errStr(e) + '), retrying with defaults', 'warn'); stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false }); }
     log(`Camera: got "${stream.getVideoTracks()[0]?.label || '?'}"`);
     video.srcObject = stream;
@@ -663,7 +757,7 @@ async function initCamera() {
       t0 = performance.now();
       try {
         landmarker = await PoseLandmarker.createFromOptions(fileset, opts(delegate));
-        log(`Model: loaded with ${delegate} in ${Math.round(performance.now() - t0)} ms`);
+        log(`Model: loaded with ${delegate} in ${Math.round(performance.now() - t0)} ms`); perf.delegate = delegate;
         break;
       } catch (e) {
         log(`Model: ${delegate} failed: ${errStr(e)}`, delegate === 'GPU' ? 'warn' : 'error');
@@ -717,7 +811,8 @@ function pollPose(now) {
   if (!landmarker || video.readyState < 2 || video.currentTime === lastVideoTime) return;
   lastVideoTime = video.currentTime;
   let res;
-  try { res = landmarker.detectForVideo(video, now); }
+  const t0 = performance.now();
+  try { res = landmarker.detectForVideo(video, now); perf.detects++; perf.detectMs += performance.now() - t0; }
   catch (e) { if (detectErrors++ < 5) log('detectForVideo failed: ' + errStr(e), 'error'); return; }
   const list = cleanDetections(res.landmarks || []);
   if (firstDetect) { firstDetect = false; log(`Detection running (${list.length} people in first frame)`); }
@@ -920,6 +1015,11 @@ addEventListener('keydown', e => {
   const active = solo ? [players[0]] : players;
   if (k === 'f') { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {}); return; }
   if (k === 'm') { swapLR = !swapLR; log('Sides ' + (swapLR ? 'swapped' : 'normal')); return; }
+  if (k === '+' || k === '=' || k === '-') {
+    C.musicVolume = Math.max(0, Math.min(2, Math.round((C.musicVolume + (k === '-' ? -0.25 : 0.25)) * 100) / 100));
+    log(`Music volume ${Math.round(C.musicVolume * 100)}%`); return;
+  }
+  if (k === 'n') { music.on = !music.on; log('Music ' + (music.on ? 'on' : 'off')); return; }
   if (k === 'b') { showDbg = verbose = !showDbg; log('Gesture debug ' + (verbose ? 'on' : 'off')); return; }
   if (k === '0' || k === '1' || k === '2') { setModeSetting(k === '0' ? 'auto' : k === '1' ? 'solo' : 'duo'); return; }
   if (k === 'p') {
@@ -939,15 +1039,24 @@ addEventListener('keydown', e => {
 // Main loop
 // ---------------------------------------------------------------------------
 let last = performance.now();
+const perf = { frames: 0, detects: 0, detectMs: 0, since: performance.now(), delegate: '-' };
 function frame(now) {
+  requestAnimationFrame(frame);
+  if (now - last < 1000 / C.maxFps - 2) return;          // frame cap: skip extra screen refreshes
   const dt = Math.min(50, now - last); last = now;
+  perf.frames++;
   pollPose(now);
   for (const p of players) {
     if (solo && p.i === 1) continue;
     applyPlayer(p, now); p.game.update(dt); drawBoard(p);
   }
   drawCam();
-  requestAnimationFrame(frame);
+  if (now - perf.since >= 10000) {
+    const sec = (now - perf.since) / 1000;
+    log(`perf: ${(perf.frames / sec).toFixed(0)} fps drawn, ${(perf.detects / sec).toFixed(0)} detections/s, ` +
+        `${perf.detects ? (perf.detectMs / perf.detects).toFixed(1) : '-'} ms per detection (${perf.delegate})`);
+    perf.frames = perf.detects = perf.detectMs = 0; perf.since = now;
+  }
 }
 function setHelp() {
   $('#howto').innerHTML =
@@ -961,6 +1070,11 @@ function setHelp() {
 addEventListener('resize', resize);
 try { localStorage.removeItem('wallfall-scheme'); } catch (e) {}   // old carry/step setting: no longer used
 setHelp();
+// Try to turn sound on right away. Works when the browser allows it (e.g. Chrome started by start.sh);
+// otherwise it stays off until the first key press or click.
+unlockAudio();
+setTimeout(() => log(actx && actx.state === 'running' ? 'Sound: on' : 'Sound is OFF until you press a key or click the page (or start the game with ./start.sh)'), 500);
+setInterval(() => { musicTick(); $('#soundHint').classList.toggle('hidden', !!actx && actx.state === 'running'); }, 30);
 setMode(solo);
 requestAnimationFrame(frame);
 initCamera();
