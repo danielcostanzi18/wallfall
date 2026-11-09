@@ -84,3 +84,19 @@ Enter start · P pause · 0/1/2 players · F fullscreen · M swap sides (camera 
 - Put the laptop below the projected image with the camera facing the players.
 - Players should be visible from head to hips, ideally to the knees.
 - Gesture thresholds are in the `C` object at the top of the script in `index.html`.
+
+## Starguard (second game)
+
+`starguard.html`: an original co-op space shooter for 1–2 players, using the same camera setup.
+Run `./start.sh 8000 starguard.html` (or `python3 serve.py` and open http://localhost:8000/starguard.html).
+
+| Body | Action |
+|---|---|
+| Step / lean left–right | Fly (your position in the room is the ship's position) |
+| Arms out wide (T-pose) | Spread shot while held (uses the yellow energy bar) |
+| Squat | Shield, up to 2.5 s (no shooting meanwhile) |
+| Both hands above your head, hold | NOVA bomb (clears the screen) / start / join / resume |
+
+The ship fires by itself. It gets faster and busier over 4 minutes, and a Warden boss arrives every 80 s.
+A second person can join mid-game by holding both hands up. Tuning is in the `C` object at the top.
+Keys: P1 A/D fly · W spread · S shield · E nova — P2 ←/→ · ↑ · ↓ · / — Enter start · P pause · V camera · M mirror · B gesture debug.
